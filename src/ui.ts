@@ -259,6 +259,7 @@ function settingsView() {
   const lng = sel([['ru', 'Русский'], ['en', 'English']], lang);
   lng.onchange = () => { setLang(lng.value as 'ru' | 'en'); settingsView(); };
   const low = h('input', { type: 'checkbox', checked: conf.get('low', false), onchange: () => conf.set('low', low.checked) }) as HTMLInputElement;
+  const rr = h('input', { type: 'checkbox', checked: conf.get('rr', true), onchange: () => conf.set('rr', rr.checked) }) as HTMLInputElement;
   const nop = h('input', { type: 'checkbox', checked: app.noP2P, onchange: () => { app.noP2P = nop.checked; conf.set('nop2p', nop.checked); } }) as HTMLInputElement;
   const af = sel([['auto', t('auto')], ['on', t('on')], ['off', t('off')]], app.wire.antiFreeze);
   af.onchange = () => { app.wire.antiFreeze = af.value as any; conf.set('af', af.value); };
@@ -299,6 +300,7 @@ function settingsView() {
   mount(h('div.page', bar(t('settings')), h('main.body',
     field(t('lang'), lng),
     h('label.check', low, h('span', t('lowData'))),
+    h('label.check', rr, h('span', t('readRcpt'))),
     own,
     h('details', h('summary', '🛠 ' + t('diag') + ' / network'),
       field(t('antiFreeze'), af),

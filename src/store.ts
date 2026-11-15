@@ -1,6 +1,6 @@
 // Local persistence: IndexedDB for rooms/messages/files (fast mode only), localStorage for settings.
 export interface FileMeta { name: string; size: number; mime: string; tid: number; dur?: number; voice?: boolean }
-export interface Msg { id: string; mine: boolean; ts: number; text?: string; file?: FileMeta; st: 0 | 1; sys?: string; arg?: string; del?: number }
+export interface Msg { id: string; mine: boolean; ts: number; text?: string; file?: FileMeta; st: 0 | 1 | 2; sys?: string; arg?: string; del?: number }
 export interface RoomRec {
   id: string; secret: string; role: 'h' | 'g'; mode: 'f' | 's'; name: string;
   created: number; exp: number; invExp: number; reusable: boolean;

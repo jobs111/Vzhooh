@@ -96,7 +96,7 @@ export function chatView(room: Room) {
     const el = h('div.msg' + (m.mine ? '.me' : ''),
       m.text ? h('div.txt', linkify(m.text)) : null,
       m.file ? fileEl(m) : null,
-      h('div.meta', m.del ? '⏱ ' : '', fmtClock(m.ts), m.mine ? (m.st ? ' ✓' : ' 🕓') : ''));
+      h('div.meta', m.del ? '⏱ ' : '', fmtClock(m.ts), m.mine ? (m.st === 2 ? h('span.tick.read', { title: t('read') }, ' ✓✓') : m.st ? h('span.tick', { title: t('delivered') }, ' ✓') : ' 🕓') : ''));
     el.dataset.id = m.id;
     return el;
   };
@@ -178,7 +178,7 @@ export function chatView(room: Room) {
     const st = roomStatus(room);
     dot.className = 'dot ' + st.cls;
     sub.textContent = st.text + (room.rec.mode === 's' ? ' · 🔒' : '') + (room.rec.exp ? ' · ' + t('until', new Date(room.rec.exp).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })) : '');
-    callA.disabled = callV.disabled = room.state !== 'up';
+    callA.disabled = callV.disabled = room.state !== 'up' || !room.online;
     banner.replaceChildren();
     if (room.reject) banner.append(h('p.err', t('rj_' + (['used', 'exp', 'rev', 'ver', 'sig', 'full'].includes(room.reject) ? room.reject : 'no'))));
     else if (room.state === 'off') banner.append(h('button.primary', { onclick: () => room.start() }, t('connect')));
@@ -192,14 +192,14 @@ export function chatView(room: Room) {
   };
 
   // ----- call room: the owner's side calls by itself as soon as the peer is here -----
-  let upAt = 0, warned = false;
+  // (waits a few seconds for a direct link; without one the call goes by voice through the relay)
+  let upAt = 0;
   function autoCall() {
     const r = room.rec;
     if (!r.call || room.state !== 'up' || !room.online) { upAt = 0; return; }
     if (!room.host || r.called || room.call.st !== 'idle') return;
     upAt ||= now();
-    if (room.direct) { r.called = true; room.save(); void startCall(r.call === 'v'); }
-    else if (!warned && now() - upAt > 9000) { warned = true; room.retryDirect(); toast(t('callNoP2P'), 8000); }
+    if (room.canDirectCall || now() - upAt > 6000 || app.noP2P) { r.called = true; room.save(); void startCall(r.call === 'v'); }
   }
 
   // ----- menu -----
@@ -291,8 +291,9 @@ export function chatView(room: Room) {
   callBox.append(remoteV, localV, callInfo, callBtns);
   let callTick: any, wake: any;
   async function startCall(video: boolean) {
+    if (!room.canDirectCall) { room.retryDirect(); if (video) toast(t('videoRelay'), 6000); }
     try { await room.callStart(video); }
-    catch (e: any) { const nop = e?.message === 'nop2p'; if (nop) room.retryDirect(); toast(t(nop ? 'callNoP2P' : 'mediaErr'), 8000); }
+    catch { toast(t('mediaErr'), 8000); }
   }
   const accept = async (video: boolean) => { try { await room.callAccept(video); } catch { toast(t('mediaErr'), 8000); } };
   const screen = async () => {
@@ -313,7 +314,7 @@ export function chatView(room: Room) {
     callBox.hidden = false;
     const title = roomTitle(room);
     if (c.st === 'in') {
-      callInfo.replaceChildren(h('div.cname', title), h('div', t(c.video ? 'incomingV' : 'incoming')));
+      callInfo.replaceChildren(...[h('div.cname', title), h('div', t(c.video ? 'incomingV' : 'incoming')), c.relay ? h('div.cvia', t('callRelay')) : null].filter(Boolean) as Node[]);
       callBtns.replaceChildren(...[cb('📞 ' + t('accept'), () => void accept(false), '.ok', 'call-accept'),
         c.video ? cb('🎥 ' + t('acceptV'), () => void accept(true), '.ok', 'call-accept-video') : null,
         cb('✕ ' + t('decline'), () => room.callDecline(), '.bad')].filter(Boolean) as Node[]);
@@ -322,8 +323,9 @@ export function chatView(room: Room) {
     if (rtc?.local && localV.srcObject !== rtc.local) localV.srcObject = rtc.local;
     localV.hidden = !(c.cam || c.scr);
     localV.classList.toggle('scr', c.scr);
+    const via = c.relay ? h('div.cvia', t('callRelay')) : null;
     if (c.st === 'out') {
-      callInfo.replaceChildren(h('div.cname', title), h('div', t('calling')));
+      callInfo.replaceChildren(...[h('div.cname', title), h('div', t('calling')), via].filter(Boolean) as Node[]);
       callBtns.replaceChildren(cb('✕ ' + t('hangup'), () => room.callEnd(), '.bad', 'call-end'));
       return;
     }
@@ -332,12 +334,12 @@ export function chatView(room: Room) {
     const time = h('div.ctime');
     const upd = () => { time.textContent = fmtDur((now() - c.t0) / 1000) + (rtc && rtc.pc.connectionState !== 'connected' ? ' · ' + t('reconnecting') : '') + (c.rau ? '' : ' · 🔇'); };
     upd(); callTick = setInterval(upd, 1000);
-    callInfo.replaceChildren(h('div.cname', title), time);
+    callInfo.replaceChildren(...[h('div.cname', title), time, via].filter(Boolean) as Node[]);
     callBtns.replaceChildren(...[
       cb(c.mic ? '🎙' : '🔇', () => room.toggleMic(), c.mic ? '' : '.offb', 'call-mic', t('voice')),
-      c.scr ? null : cb(c.cam ? '📷' : '🚫📷', () => void room.toggleCam().catch(() => toast(t('mediaErr'))), c.cam ? '' : '.offb', 'call-cam', t('videoCall')),
+      c.scr || c.relay ? null : cb(c.cam ? '📷' : '🚫📷', () => void room.toggleCam().catch(() => toast(t('mediaErr'))), c.cam ? '' : '.offb', 'call-cam', t('videoCall')),
       c.cam && !c.scr ? cb('🔄', () => void room.switchCam().catch(() => {})) : null,
-      canScreen() ? cb('🖥', () => void screen(), c.scr ? '.onb' : '', 'call-screen', t('screen')) : null,
+      canScreen() && !c.relay ? cb('🖥', () => void screen(), c.scr ? '.onb' : '', 'call-screen', t('screen')) : null,
       cb('✕ ' + t('hangup'), () => room.callEnd(), '.bad', 'call-end')].filter(Boolean) as Node[]);
     if (!wake && (navigator as any).wakeLock) (navigator as any).wakeLock.request('screen').then((w: any) => { wake = w; }).catch(() => {});
   };

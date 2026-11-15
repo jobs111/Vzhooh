@@ -346,6 +346,57 @@ const tests = {
     ok('message written offline is delivered', !!(await hasText(guest, 'написано без связи')));
     ok('banner disappears', !!(await until(() => host.evaluate(() => document.querySelector('.netbar').hidden), 6000)));
   },
+  async receipts(browser) {
+    const { host, guest, up } = await pair(browser);
+    ok('session', !!up);
+    await guest.goto(URL0);   // guest is not looking at the chat
+    await sendText(host, 'прочитай меня');
+    const tickOf = () => host.evaluate(() => { const m = [...document.querySelectorAll('.msg.me')].pop(); return m && m.querySelector('.meta').textContent; });
+    ok('delivered: one tick while unread', !!(await until(async () => { const x = await tickOf(); return x && x.includes('✓') && !x.includes('✓✓'); })));
+    await guest.waitForTimeout(1200);
+    ok('still one tick while the chat is closed', !(await tickOf()).includes('✓✓'));
+    await guest.click('.room >> nth=0');
+    ok('read: two ticks once the chat is opened', !!(await until(async () => (await tickOf()).includes('✓✓'), 8000)));
+    await sendText(host, 'а это сразу');
+    ok('read at once while the chat is on screen', !!(await until(async () => { const x = await tickOf(); return x.includes('✓✓') && (await host.evaluate(() => [...document.querySelectorAll('.msg.me')].pop().textContent.includes('а это сразу'))); }, 8000)));
+  },
+  async relaycall(browser) {
+    const { host, guest, up } = await pair(browser, { hostConf: { nop2p: true }, guestConf: { nop2p: true } });
+    ok('session via relay only', !!up && !(await st(host)).direct);
+    await host.click('button[title="Звонок"]');
+    ok('guest rings (relay call)', !!(await until(async () => (await st(guest)).call === 'in', 8000)));
+    ok('incoming screen says voice via relay', (await guest.textContent('.call')).includes('через ретранслятор'));
+    await guest.click('#call-accept');
+    ok('relay call active on both', !!(await until(async () => (await st(host)).call === 'on' && (await st(guest)).call === 'on', 10000)));
+    const rs = p => p.evaluate(() => { const s = [...__vz.rooms.values()][0].relayStats; return s ? { ...s } : null; });
+    const flowing = await until(async () => { const a = await rs(host), b = await rs(guest); return a && b && a.rx > 40 && b.rx > 40 ? { a, b } : null; }, 15000, 500);
+    ok('voice packets flow both ways', !!flowing, flowing ? `host rx ${flowing.a.rx} (${flowing.a.codecIn}), guest rx ${flowing.b.rx} (${flowing.b.codecIn})` : '');
+    ok('microphone is captured', !!(await until(async () => (await rs(host)).peak > 0.01 && (await rs(guest)).peak > 0.01, 6000)));
+    ok('received voice is audible (not silence)', !!(await until(async () => (await rs(host)).rxPeak > 0.01 && (await rs(guest)).rxPeak > 0.01, 6000)), (await rs(host)).rxPeak.toFixed(3));
+    await host.click('#call-mic');
+    const tx0 = (await rs(host)).tx; await host.waitForTimeout(1200);
+    ok('mute stops sending', (await rs(host)).tx - tx0 < 3);
+    await host.click('#call-mic');
+    await host.click('#call-end');
+    ok('relay call ends on both', !!(await until(async () => (await st(guest)).call === 'idle' && (await st(host)).call === 'idle', 8000)));
+    // video button without a direct link → voice call through the relay
+    await guest.click('button[title="Видеозвонок"]');
+    ok('video request falls back to a relay voice call', !!(await until(async () => (await st(host)).call === 'in', 8000)) && (await host.textContent('.call')).includes('через ретранслятор'));
+    await host.click('#call-accept');
+    ok('fallback call connects', !!(await until(async () => { const a = await rs(host); return a && a.rx > 20; }, 12000)));
+    await guest.click('#call-end');
+  },
+  async adpcm(browser) {
+    const { host, guest, up } = await pair(browser, { hostConf: { nop2p: true, codec: 'a' }, guestConf: { nop2p: true } });
+    ok('session', !!up);
+    await guest.click('button[title="Звонок"]');
+    await until(async () => (await st(host)).call === 'in', 8000);
+    await host.click('#call-accept');
+    const rs = p => p.evaluate(() => { const s = [...__vz.rooms.values()][0].relayStats; return s ? { ...s } : null; });
+    const r = await until(async () => { const a = await rs(host), b = await rs(guest); return a && b && a.rx > 30 && b.rx > 30 && a.rxPeak > 0.01 && b.rxPeak > 0.01 ? { a, b } : null; }, 15000, 500);
+    ok('fallback codec (no Opus on one side) carries audible voice both ways', !!r, r ? `host in ${r.a.codecIn}/out ${r.a.codecOut}, guest in ${r.b.codecIn}/out ${r.b.codecOut}` : '');
+    await host.click('#call-end');
+  },
   async relay(browser) {
     const { host, guest, up } = await pair(browser, { hostConf: { nop2p: true }, guestConf: { nop2p: true } });
     ok('session via relay only', !!up && !(await st(host)).direct);
@@ -361,8 +412,6 @@ const tests = {
       return [...new Uint8Array(h)].map(x => x.toString(16).padStart(2, '0')).join('');
     }), 40000);
     ok('180 KB file via relay intact', got === require('crypto').createHash('sha256').update(data).digest('hex'));
-    await host.click('button[title="Звонок"]');
-    ok('call refused without direct link (toast)', !!(await until(() => host.evaluate(() => !!document.querySelector('.toast')))));
     // disconnect → peer sees offline
     await guest.click('#menu-btn');
     await guest.getByRole('button', { name: /Разорвать соединение/ }).click();

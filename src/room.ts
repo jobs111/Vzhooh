@@ -4,8 +4,10 @@ import { app } from './app';
 import { aesKey, ecdh, ecdhGen, hkdf, hmac, KeyPair, ownerSign, ownerVerify, sasEmoji, seal, unseal } from './crypto';
 import { Xfer } from './files';
 import { sendJoin } from './lobby';
-import { Rtc } from './rtc';
-import { db, FileMeta, Msg, RoomRec } from './store';
+import { localCodecs, RelayAudio } from './rcall';
+import { lowData, Rtc } from './rtc';
+import { stats } from './stats';
+import { conf, db, FileMeta, Msg, RoomRec } from './store';
 import { b64, canZ, concat, deflate, Emitter, eq, inflate, now, rnd, td, te, U8, unb64 } from './util';
 
 export const PROTO = 1;
@@ -13,7 +15,10 @@ const PERSIST_MAX = 16 * 1024 * 1024;
 type Op = Record<string, any>;
 const J = (o: Op) => concat([0], te.encode(JSON.stringify(o)));
 
-export interface CallState { st: 'idle' | 'out' | 'in' | 'on'; video: boolean; at: number; t0: number; rau: boolean; rvi: boolean; mic: boolean; cam: boolean; scr: boolean }
+export interface CallState { st: 'idle' | 'out' | 'in' | 'on'; video: boolean; at: number; t0: number; rau: boolean; rvi: boolean; mic: boolean; cam: boolean; scr: boolean; relay?: boolean }
+const AUDIO_C: MediaTrackConstraints = { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 };
+const getMic = () => navigator.mediaDevices.getUserMedia({ audio: AUDIO_C });
+const stopStream = (s?: MediaStream) => s?.getTracks().forEach(t => t.stop());
 const idleCall = (): CallState => ({ st: 'idle', video: false, at: 0, t0: 0, rau: true, rvi: false, mic: true, cam: false, scr: false });
 
 export class Room extends Emitter {
@@ -188,6 +193,7 @@ export class Room extends Emitter {
     if (!this.host && !this.confirmed) { this.confirmed = true; this.sessionUp(); }
     this.touch();
     if (pt[0] === 1) { this.xfer.onChunk(pt.subarray(1), false); return; }
+    if (pt[0] === 3) { this.relay?.onPacket(pt.subarray(1)); return; }
     const o = await this.parse(pt);
     if (o) await this.onOp(o, false);
   }
@@ -301,7 +307,9 @@ export class Room extends Emitter {
     for (const m of this.msgs) if (m.mine && m.st === 0 && !m.sys) this.sendR(this.msgOp(m));
     if (this.rec.dead) this.sendR({ t: 'wipe' }, undefined, ok => { if (ok) app.removeRoom(this); });
     if (this.host && this.rec.share && this.rec.lid) app.lobbies.get(this.rec.lid)?.serve(this);
+    this.rdSent = '';
     this.emit('state');
+    this.readNow();
     this.xfer.linkChanged();
   }
 
@@ -337,7 +345,7 @@ export class Room extends Emitter {
     const t = now();
     for (const [id, x] of this.out) if (x.tries > 0 && t - x.at > 1200) this.xmit(id);
     const m = this.msgs.find(x => x.id === i && x.mine);
-    if (m && m.st === 0) { m.st = 1; this.persistMsg(m); this.emit('msg', m); }
+    if (m && m.st === 0) { m.st = 1; this.persistMsg(m); this.emit('msg', m); stats.add('delivered'); }
   }
   private queueAck(i: string, viaDc: boolean) {
     this.ackQ.push(i);
@@ -456,6 +464,7 @@ export class Room extends Emitter {
       case 'fn': this.xfer.onNak(o.f >>> 0); break;
       case 'c': this.onCall(o); break;
       case 'dm': if (typeof o.m === 'string') this.removeMsg(o.m, false); break;
+      case 'rd': if (typeof o.u === 'string') this.onRead(o.u); break;
     }
   }
   private onCfg(o: Op) {
@@ -546,6 +555,7 @@ export class Room extends Emitter {
     if (!text) return;
     const m: Msg = { id: b64(rnd(6)), mine: true, ts: now(), text: text.slice(0, 20000), st: 0 };
     this.addMsg(m);
+    stats.add('msgOut');
     if (this.state === 'up') this.sendR(this.msgOp(m));
   }
   sendFile(blob: Blob, name: string, extra?: { voice?: boolean; dur?: number }) {
@@ -554,6 +564,7 @@ export class Room extends Emitter {
     const file: FileMeta = { name: name.slice(0, 200), size: blob.size, mime: blob.type || 'application/octet-stream', tid, ...extra };
     const m: Msg = { id: b64(rnd(6)), mine: true, ts: now(), st: 0, file };
     this.persistBlob(tid, blob);
+    stats.add('fileOut'); stats.add('fileOutBytes', blob.size);
     this.addMsg(m);
     if (this.state === 'up') this.sendR(this.msgOp(m));
   }
@@ -594,6 +605,7 @@ export class Room extends Emitter {
     if (this.rec.share && m.text && this.msgs.some(x => !x.mine && x.text === m.text)) return;
     if (app.active !== this.rec.id || document.hidden) this.rec.unread++;
     this.addMsg(m);
+    stats.add(m.file ? 'fileIn' : 'msgIn');
     if (m.file) this.xfer.auto(m);
     app.notify(this);
   }
@@ -614,7 +626,27 @@ export class Room extends Emitter {
     this.sysMsg('timer', String(sec));
     this.emit('state');
   }
-  markRead() { if (this.rec.unread) { this.rec.unread = 0; this.save(); app.emit('rooms'); } }
+  markRead() {
+    if (this.rec.unread) { this.rec.unread = 0; this.save(); app.emit('rooms'); }
+    this.readNow();
+  }
+  private rdSent = '';
+  /** Chat is on screen: tell the peer we have read everything up to the last incoming message. */
+  readNow() {
+    if (this.state !== 'up' || app.active !== this.rec.id || document.hidden || !conf.get('rr', true)) return;
+    const last = [...this.msgs].reverse().find(m => !m.mine && !m.sys);
+    if (!last || last.id === this.rdSent) return;
+    this.rdSent = last.id;
+    this.sendR({ t: 'rd', u: last.id }, 'rd');
+  }
+  /** Peer has read up to my message u: mark it and everything I sent before it as read. */
+  private onRead(u: string) {
+    const tgt = this.msgs.find(m => m.mine && m.id === u);
+    if (!tgt) return;
+    for (const m of this.msgs) {
+      if (m.mine && !m.sys && m.ts <= tgt.ts && m.st !== 2) { m.st = 2; this.persistMsg(m); this.emit('msg', m); }
+    }
+  }
 
   // ---------- wipe ----------
   private async wipeLocal() {
@@ -646,20 +678,42 @@ export class Room extends Emitter {
   }
 
   // ---------- calls ----------
+  // Two kinds: a direct WebRTC call (audio/video/screen) when a direct link exists,
+  // and a voice call through the relay (RelayAudio) when it does not.
+  private relay?: RelayAudio;
+  private relayMic?: MediaStream;
+  private peerCodecs: string[] = [];
   private setCall(p: Partial<CallState>) { Object.assign(this.call, p); this.emit('call'); }
   private sendMediaState() { this.sendR({ t: 'c', a: 'st', au: this.call.mic ? 1 : 0, vi: this.call.cam || this.call.scr ? 1 : 0 }, 'cst'); }
+  get canDirectCall() { return this.direct && !!this.rtc; }
   async callStart(video: boolean) {
-    if (this.call.st !== 'idle') return;
-    if (!this.direct || !this.rtc) throw new Error('nop2p');
-    await this.rtc.getMedia(video);
-    if (this.call.st !== 'idle' || !this.rtc?.local) { this.rtc?.stopMedia(); return; }
-    this.call = { ...idleCall(), st: 'out', video, at: now(), cam: video };
-    this.sendR({ t: 'c', a: 'ring', v: video ? 1 : 0 });
+    if (this.call.st !== 'idle' || this.state !== 'up') return;
+    const relay = !this.canDirectCall;
+    if (relay) {
+      this.relayMic = await getMic();
+      if (this.call.st !== 'idle') { stopStream(this.relayMic); this.relayMic = undefined; return; }
+      video = false;
+    } else {
+      await this.rtc!.getMedia(video);
+      if (this.call.st !== 'idle' || !this.rtc?.local) { this.rtc?.stopMedia(); return; }
+    }
+    this.call = { ...idleCall(), st: 'out', video, at: now(), cam: video, relay };
+    this.sendR({ t: 'c', a: 'ring', v: video ? 1 : 0, rl: relay ? 1 : 0, ac: await localCodecs() });
     this.emit('call');
   }
   async callAccept(video: boolean) {
-    const rtc = this.rtc;
-    if (this.call.st !== 'in' || !rtc) return;
+    const c = this.call;
+    if (c.st !== 'in') return;
+    if (c.relay || !this.canDirectCall) {
+      try { this.relayMic = await getMic(); } catch (e) { this.callDecline(); throw e; }
+      if (this.call.st !== 'in') { stopStream(this.relayMic); this.relayMic = undefined; return; }
+      this.setCall({ st: 'on', t0: now(), cam: false, relay: true });
+      this.sendR({ t: 'c', a: 'acc', rl: 1, ac: await localCodecs() });
+      await this.startRelay();
+      this.sendMediaState();
+      return;
+    }
+    const rtc = this.rtc!;
     try { await rtc.getMedia(video); } catch (e) { this.callDecline(); throw e; }
     if (this.call.st !== 'in') { rtc.stopMedia(); return; }
     await rtc.attach(false);
@@ -668,31 +722,64 @@ export class Room extends Emitter {
     this.sendR({ t: 'c', a: 'acc' });
     this.sendMediaState();
   }
+  private async startRelay() {
+    if (!this.relayMic || this.relay) return;
+    const mine = await localCodecs();
+    try {
+      this.relay = new RelayAudio(pkt => void this.sendWire(1, concat([3], pkt), true), this.peerCodecs, mine, lowData() ? 12000 : 20000);
+      await this.relay.start(this.relayMic);
+      this.relay.muted = !this.call.mic;
+    } catch (e) { console.warn('relay audio', e); }
+    this.emit('call');
+  }
+  get relayStats() { return this.relay?.stats; }
   callDecline() { if (this.call.st === 'in') { this.sendR({ t: 'c', a: 'dec' }); this.callCleanup('declined'); } }
   callEnd() { if (this.call.st !== 'idle') { this.sendR({ t: 'c', a: 'end' }); this.callCleanup('ended'); } }
   private callCleanup(why: string) {
     const c = this.call;
     if (c.st === 'idle') return;
     this.rtc?.stopMedia();
+    this.relay?.stop(); this.relay = undefined;
+    if (this.relayMic) { stopStream(this.relayMic); this.relayMic = undefined; }
     this.call = idleCall();
     this.sysMsg('call_' + why, c.t0 ? String(Math.round((now() - c.t0) / 1000)) : '');
+    stats.add(c.relay ? 'callRelay' : 'callDirect', c.t0 ? Math.round((now() - c.t0) / 1000) : 0);
     this.emit('call', why);
   }
   private onCall(o: Op) {
     const c = this.call;
     switch (o.a) {
       case 'ring':
-        if (c.st === 'idle') { this.call = { ...idleCall(), st: 'in', video: !!o.v, at: now() }; this.emit('call'); app.notify(this, true); }
+        if (Array.isArray(o.ac)) this.peerCodecs = o.ac.map(String);
+        if (c.st === 'idle') { this.call = { ...idleCall(), st: 'in', video: !!o.v && !o.rl, at: now(), relay: !!o.rl }; this.emit('call'); app.notify(this, true); }
         else if (c.st === 'out' && !this.host) { // both pressed "call": the host's call wins, the guest answers it
           void (async () => {
-            await this.rtc?.attach(false); this.rtc?.leftovers();
-            this.setCall({ st: 'on', t0: now() });
-            this.sendR({ t: 'c', a: 'acc' }); this.sendMediaState();
+            if (o.rl || c.relay) {
+              if (!this.relayMic) this.relayMic = await getMic().catch(() => undefined);
+              this.setCall({ st: 'on', t0: now(), relay: true, video: false, cam: false });
+              this.sendR({ t: 'c', a: 'acc', rl: 1, ac: await localCodecs() });
+              this.rtc?.stopMedia();
+              await this.startRelay();
+            } else {
+              await this.rtc?.attach(false); this.rtc?.leftovers();
+              this.setCall({ st: 'on', t0: now() });
+              this.sendR({ t: 'c', a: 'acc' });
+            }
+            this.sendMediaState();
           })();
         } else if (c.st !== 'out') this.sendR({ t: 'c', a: 'busy' });
         break;
       case 'acc':
-        if (c.st === 'out') { this.setCall({ st: 'on', t0: now() }); void this.rtc?.attach(true); this.sendMediaState(); }
+        if (c.st !== 'out') break;
+        if (Array.isArray(o.ac)) this.peerCodecs = o.ac.map(String);
+        if (o.rl || c.relay) {
+          void (async () => {
+            if (!this.relayMic) { this.rtc?.stopMedia(); this.relayMic = await getMic().catch(() => undefined); }
+            this.setCall({ st: 'on', t0: now(), relay: true, video: false, cam: false });
+            await this.startRelay();
+            this.sendMediaState();
+          })();
+        } else { this.setCall({ st: 'on', t0: now() }); void this.rtc?.attach(true); this.sendMediaState(); }
         break;
       case 'dec': if (c.st === 'out') this.callCleanup('declined'); break;
       case 'busy': if (c.st === 'out') this.callCleanup('busy'); break;
@@ -700,7 +787,16 @@ export class Room extends Emitter {
       case 'st': this.setCall({ rau: !!o.au, rvi: !!o.vi }); break;
     }
   }
-  toggleMic() { if (this.rtc && this.call.st === 'on') { this.setCall({ mic: this.rtc.toggleMic() }); this.sendMediaState(); } }
+  toggleMic() {
+    if (this.call.st !== 'on') return;
+    if (this.call.relay) {
+      const on = !this.call.mic;
+      if (this.relay) this.relay.muted = !on;
+      this.relayMic?.getAudioTracks().forEach(t => { t.enabled = on; });
+      this.setCall({ mic: on });
+    } else if (this.rtc) this.setCall({ mic: this.rtc.toggleMic() });
+    this.sendMediaState();
+  }
   async toggleCam() {
     if (!this.rtc || this.call.st !== 'on') return;
     const on = await this.rtc.setCam(!this.call.cam);

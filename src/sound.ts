@@ -1,6 +1,6 @@
 // Tiny sounds via WebAudio (no audio files to download).
 let ctx: AudioContext | null = null;
-function ac(): AudioContext | null {
+export function ac(): AudioContext | null {
   try {
     ctx ||= new (window.AudioContext || (window as any).webkitAudioContext)();
     if (ctx.state === 'suspended') void ctx.resume();

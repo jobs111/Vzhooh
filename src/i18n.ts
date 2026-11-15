@@ -201,6 +201,11 @@ const S: Record<string, [string, string]> = {
   mCopy: ['Копировать', 'Copy'],
   mDelMe: ['Удалить у меня', 'Delete for me'],
   mDelAll: ['Удалить у всех', 'Delete for everyone'],
+  read: ['Прочитано', 'Read'],
+  delivered: ['Доставлено', 'Delivered'],
+  readRcpt: ['Показывать собеседнику, что я прочитал сообщение', 'Let others see when I have read a message'],
+  callRelay: ['через ретранслятор · только голос', 'via relay · voice only'],
+  videoRelay: ['Прямой связи нет — звоню голосом через ретранслятор (видео так не передать).', 'No direct link — calling by voice through the relay (video cannot go that way).'],
 };
 
 export type Lang = 'ru' | 'en';
