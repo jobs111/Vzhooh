@@ -683,12 +683,13 @@ const tests = {
       await victim.goto(flink);
       const rej = await until(async () => (await st(victim))?.reject, 10000);
       ok('room of a non-owner is refused', rej === 'sig', String(rej));
-    } finally { delete srv.overrides['/owner.json']; }
+    } finally { srv.overrides['/owner.json'] = '{}'; }
   },
 };
 
 (async () => {
   fs.mkdirSync(OUT, { recursive: true });
+  require('./serve.cjs').overrides['/owner.json'] = '{}';   // tests run as an unclaimed site unless a test claims it
   const web = await serve(DIST, WEB);
   const env = { mq: await broker(MQ) };
   const browser = await chromium.launch({ proxy: process.env.REAL ? { server: process.env.HTTPS_PROXY, bypass: '127.0.0.1,localhost' } : undefined, args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', '--disable-features=WebRtcHideLocalIpsWithMdns', '--autoplay-policy=no-user-gesture-required'] });
