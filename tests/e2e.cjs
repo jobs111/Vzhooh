@@ -428,6 +428,51 @@ const tests = {
     await host.goto(URL0 + '#stat');
     ok('statistics screen shows counters', !!(await until(() => host.evaluate(() => document.querySelectorAll('.srow').length > 8 && /[1-9]/.test(document.querySelector('.srow:nth-child(2)').textContent)))));
   },
+  async compress(browser) {
+    const { host, guest, up } = await pair(browser);
+    ok('session', !!up);
+    await until(async () => (await st(host)).direct, 12000);
+    // a big noisy photo
+    const orig = await host.evaluate(async () => {
+      const c = document.createElement('canvas'); c.width = 2400; c.height = 1800; const g = c.getContext('2d');
+      const d = g.createImageData(2400, 1800); for (let i = 0; i < d.data.length; i += 4) { const v = (i / 4 % 2400) / 10 + Math.random() * 60; d.data[i] = v; d.data[i + 1] = 255 - v; d.data[i + 2] = Math.random() * 255; d.data[i + 3] = 255; }
+      g.putImageData(d, 0, 0);
+      const b = await new Promise(r => c.toBlob(r, 'image/png'));
+      const dt = new DataTransfer(); dt.items.add(new File([b], 'photo.png', { type: 'image/png' }));
+      const inp = document.querySelector('.composer input[type=file]'); inp.files = dt.files; inp.dispatchEvent(new Event('change'));
+      return b.size;
+    });
+    await host.waitForSelector('#c-sheet');
+    ok('send sheet: original is preselected', await host.evaluate(() => document.querySelector('#c-0').classList.contains('sel')));
+    await host.click('#c-2'); await host.click('#c-send');
+    const img = await until(() => guest.evaluate(() => { const i = [...[...__vz.rooms.values()][0].xfer.inc.values()].find(x => x.name === 'photo.jpg' && x.state === 'done'); const el = document.querySelector('.msg:not(.me) img.media'); return i && el && el.naturalWidth ? { size: i.size, w: el.naturalWidth, type: i.blob.type } : null; }), 20000);
+    ok('photo compressed (medium): smaller, 1600 px, shows on the other side', !!img && img.size < orig / 3 && img.w === 1600 && img.type === 'image/jpeg', img ? `${orig} → ${img.size} B` : '');
+    // a short generated video
+    const vorig = await host.evaluate(async () => {
+      const c = document.createElement('canvas'); c.width = 1280; c.height = 720; const g = c.getContext('2d');
+      let n = 0; const iv = setInterval(() => { for (let k = 0; k < 400; k++) { g.fillStyle = `hsl(${Math.random() * 360},80%,50%)`; g.fillRect(Math.random() * 1280, Math.random() * 720, 60, 60); } g.fillStyle = '#fff'; g.fillText(String(n++), 20, 20); }, 33);
+      const rec = new MediaRecorder(c.captureStream(30), { mimeType: 'video/webm;codecs=vp8', videoBitsPerSecond: 6000000 });
+      const parts = []; rec.ondataavailable = e => parts.push(e.data);
+      const done = new Promise(r => rec.onstop = r); rec.start(); await new Promise(r => setTimeout(r, 3500)); rec.stop(); await done; clearInterval(iv);
+      const b = new Blob(parts, { type: 'video/webm' });
+      const dt = new DataTransfer(); dt.items.add(new File([b], 'clip.webm', { type: 'video/webm' }));
+      const inp = document.querySelector('.composer input[type=file]'); inp.files = dt.files; inp.dispatchEvent(new Event('change'));
+      return b.size;
+    });
+    await host.waitForSelector('#c-sheet');
+    await host.click('#c-3');
+    ok('size slider shown for a single video', await host.evaluate(() => !document.querySelector('.cslider').hidden));
+    await host.click('#c-send');
+    const vid = await until(() => guest.evaluate(() => { const i = [...[...__vz.rooms.values()][0].xfer.inc.values()].find(x => /^clip\./.test(x.name) && x.state === 'done'); const el = document.querySelector('.msg:not(.me) video.media'); return i && el && el.videoWidth ? { size: i.size, w: el.videoWidth, h: el.videoHeight, name: i.name, dur: el.duration } : null; }), 60000, 500);
+    ok('video compressed (strong): smaller, downscaled, plays on the other side', !!vid && vid.size < vorig * 0.5 && vid.h === 480, vid ? `${vorig} → ${vid.size} B, ${vid.w}×${vid.h}, ${vid.name}, ${vid.dur}s` : 'orig ' + vorig);
+    // cancel sends nothing; non-media files skip the sheet
+    const before = (await st(guest)).n;
+    await host.evaluate(async () => { const dt = new DataTransfer(); dt.items.add(new File([new Uint8Array(400000)], 'x.jpg', { type: 'image/jpeg' })); const inp = document.querySelector('.composer input[type=file]'); inp.files = dt.files; inp.dispatchEvent(new Event('change')); });
+    await host.waitForSelector('#c-sheet');
+    await host.getByRole('button', { name: 'Отмена' }).click();
+    await host.waitForTimeout(600);
+    ok('cancel sends nothing', (await st(guest)).n === before && await host.locator('#c-sheet').count() === 0);
+  },
   async receipts(browser) {
     const { host, guest, up } = await pair(browser);
     ok('session', !!up);

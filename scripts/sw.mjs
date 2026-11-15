@@ -9,7 +9,7 @@ const files = [];
 (function walk(d) {
   for (const f of readdirSync(d)) {
     const p = join(d, f);
-    if (statSync(p).isDirectory()) walk(p); else { const r = relative(dist, p).replace(/\\/g, '/'); if (!skip.has(r)) files.push(r); }
+    if (statSync(p).isDirectory()) walk(p); else { const r = relative(dist, p).replace(/\\/g, '/'); if (!skip.has(r) && !(r.endsWith('.js') && statSync(p).size > 300000)) files.push(r); }   // big lazy chunks are cached on first use
   }
 })(dist);
 const hash = createHash('sha256');
@@ -29,7 +29,10 @@ self.addEventListener('fetch', e => {
   const u = new URL(e.request.url);
   if (e.request.method !== 'GET' || u.origin !== location.origin) return;
   if (/\\/(owner\\.json|probe\\.bin|sw\\.js)$/.test(u.pathname)) return;
-  e.respondWith(caches.match(e.request, { ignoreSearch: true }).then(r => r || fetch(e.request)));
+  e.respondWith(caches.match(e.request, { ignoreSearch: true }).then(r => r || fetch(e.request).then(rsp => {
+    if (rsp.ok && u.pathname.includes('/assets/')) { const c = rsp.clone(); caches.open(V).then(k => k.put(e.request, c)); }
+    return rsp;
+  })));
 });
 `);
 console.log('sw.js', V, list.length, 'files');

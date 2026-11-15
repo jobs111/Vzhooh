@@ -93,7 +93,7 @@ export class Lobby extends Emitter {
       let code = '';
       if (r.closed) code = 'rev';
       else if ((r.invExp && now() > r.invExp) || (r.exp && now() > r.exp)) code = 'exp';
-      else if (this.children().length >= (r.kind === 'files' ? LOBBY_MAX_LIVE : LOBBY_MAX_CHATS)) code = 'full';
+      else if (this.children().length >= (r.kind === 'files' ? LOBBY_MAX_LIVE : r.kind === 'group' ? 60 : LOBBY_MAX_CHATS)) code = 'full';
       if (code) { await this.nack(cs, cid, code); return; }
       if (r.kind === 'group') {
         r.n++;

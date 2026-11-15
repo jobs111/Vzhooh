@@ -3,6 +3,7 @@ import { app } from './app';
 import { RELAY_MAX, safeMime, startDownload } from './files';
 import { t } from './i18n';
 import { inviteUrl } from './invite';
+import { prepareFiles } from './media';
 import { FEAT } from './room';
 import type { Room } from './room';
 import { ring } from './sound';
@@ -14,16 +15,6 @@ import { fmtClock, fmtDur, fmtSize, h, linkify, now } from './util';
 
 function timerLabel(s: number) {
   return s === 0 ? t('off') : s === 30 ? t('s30') : s === 300 ? t('m5') : s === 600 ? t('m10') : s === 3600 ? t('h1') : s + ' s';
-}
-async function shrinkImage(f: Blob, max: number, q: number): Promise<Blob | null> {
-  try {
-    const bmp = await createImageBitmap(f);
-    const k = Math.min(1, max / Math.max(bmp.width, bmp.height));
-    const c = document.createElement('canvas');
-    c.width = Math.round(bmp.width * k); c.height = Math.round(bmp.height * k);
-    c.getContext('2d')!.drawImage(bmp, 0, 0, c.width, c.height);
-    return await new Promise(res => c.toBlob(res, 'image/jpeg', q));
-  } catch { return null; }
 }
 const canScreen = () => !!(navigator.mediaDevices as any)?.getDisplayMedia;
 
@@ -55,8 +46,9 @@ export function chatView(room: Room) {
   const media = (mime0: string, url: string, voice?: boolean): HTMLElement | null => {
     const mime = safeMime(mime0);
     if (voice || mime.startsWith('audio/')) return h('audio', { src: url, controls: true, preload: 'metadata' });
-    if (mime.startsWith('image/')) return h('img.media', { src: url, alt: '', onclick: () => lightbox(url) });
-    if (mime.startsWith('video/')) return h('video.media', { src: url, controls: true, playsInline: true, preload: 'metadata' });
+    const bad = (e: Event) => (e.target as HTMLElement).replaceWith(h('div.prog', t('noPreview')));
+    if (mime.startsWith('image/')) return h('img.media', { src: url, alt: '', onclick: () => lightbox(url), onerror: bad });
+    if (mime.startsWith('video/')) return h('video.media', { src: url, controls: true, playsInline: true, preload: 'metadata', onerror: bad });
     return null;
   };
   const fileEl = (m: Msg): HTMLElement => {
@@ -245,16 +237,12 @@ export function chatView(room: Room) {
   input.onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey && !coarse && !e.isComposing) { e.preventDefault(); sendText(); } };
   sendBtn.onclick = sendText;
   const sendFiles = async (files: Iterable<File>) => {
+    const list = await prepareFiles([...files], room.direct || room.local);
+    if (!list) return;
     let warned = false;
-    for (const f of files) {
-      let blob: Blob = f, name = f.name || 'file';
-      if (!room.direct && f.type.startsWith('image/') && f.size > 350 * 1024) {
-        const small = await shrinkImage(f, 1280, 0.72);
-        const smaller = small && small.size > RELAY_MAX ? await shrinkImage(f, 960, 0.6) : small;
-        if (smaller && smaller.size < f.size) { blob = smaller; name = name.replace(/\.[^.]+$/, '') + '.jpg'; }
-      }
-      if (!room.direct && blob.size > RELAY_MAX && !warned) { warned = true; toast(t('relayOnlySmall'), 6000); }
-      room.sendFile(blob, name);
+    for (const f of list) {
+      if (!room.direct && !room.local && f.size > RELAY_MAX && !warned) { warned = true; toast(t('relayOnlySmall'), 6000); }
+      room.sendFile(f, f.name || 'file');
     }
   };
   fileIn.onchange = () => { if (fileIn.files) void sendFiles([...fileIn.files]); fileIn.value = ''; };

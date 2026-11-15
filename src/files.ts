@@ -8,7 +8,7 @@ import { concat, fmtSize, now, sleep, U8 } from './util';
 export const RELAY_MAX = 1024 * 1024;       // biggest file allowed through public relays (they are shared, free servers)
 export const AUTO_MAX = 24 * 1024 * 1024;   // auto-download limit on a direct link
 /** Types we are willing to render inline. Everything else (HTML, SVG, ...) is treated as an opaque download. */
-export const safeMime = (m: string) => /^(image\/(png|jpeg|gif|webp)|(audio|video)\/[\w.+-]+)$/.test(m) ? m : 'application/octet-stream';
+export const safeMime = (m: string) => /^(image\/(png|jpeg|gif|webp|avif|heic|heif)|(audio|video)\/[\w.+-]+)$/.test(m) ? m : 'application/octet-stream';
 const WIRE_CHUNK = 3000;
 
 export interface Inc {
