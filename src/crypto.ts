@@ -81,3 +81,21 @@ export async function ownerVerify(pubRaw: U8, sig: U8, data: U8): Promise<boolea
     return await S.verify(SIGN, pub, bs(sig), bs(data));
   } catch { return false; }
 }
+
+// ---- Delegated admin devices: the owner signs another device's own key ("certificate"). ----
+export interface AdminCert { pub: string; sig: string; exp: number }
+export async function deviceKeyGen(): Promise<{ key: CryptoKey; pub: U8 }> {
+  const kp = await S.generateKey(ECDSA, false, ['sign', 'verify']);
+  return { key: kp.privateKey, pub: new Uint8Array(await S.exportKey('raw', kp.publicKey)) };
+}
+export const certData = (pub: U8, exp: number) => concat(te.encode('vz1/adm'), pub, te.encode(String(exp)));
+/** Was this handshake transcript signed by the owner, or by a device the owner certified? */
+export async function verifyHost(ownerPub: U8, sig: U8, tr: U8, cert?: { dk?: unknown; dc?: unknown; dx?: unknown }): Promise<boolean> {
+  if (cert && typeof cert.dk === 'string' && typeof cert.dc === 'string') {
+    const dk = unb64(cert.dk), exp = +(cert.dx as number) || 0;
+    if (exp < Date.now()) return false;
+    if (!(await ownerVerify(ownerPub, unb64(cert.dc), certData(dk, exp)))) return false;
+    return ownerVerify(dk, sig, tr);
+  }
+  return ownerVerify(ownerPub, sig, tr);
+}

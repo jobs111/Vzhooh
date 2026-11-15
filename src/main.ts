@@ -14,9 +14,22 @@ async function start() {
   initUi();
   await route();
   if ('serviceWorker' in navigator && location.protocol === 'https:') {
+    // Updates: check often, and switch to the new version by itself (never in the middle of a call or a transfer).
     const had = !!navigator.serviceWorker.controller;
-    navigator.serviceWorker.register('./sw.js').catch(() => {});
-    navigator.serviceWorker.addEventListener('controllerchange', () => { if (had) toast(t('update') + ' — ' + t('reload'), 8000); });
+    let pending = false;
+    const apply = () => {
+      if (!pending) return;
+      const busy = [...app.rooms.values()].some(r => r.call.st !== 'idle' || r.xfer.busy);
+      if (busy) return;
+      location.reload();
+    };
+    navigator.serviceWorker.addEventListener('controllerchange', () => { if (had) { pending = true; toast(t('update'), 3000); setTimeout(apply, 1200); } });
+    setInterval(apply, 5000);
+    const reg = await navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' }).catch(() => null);
+    const check = () => { void reg?.update().catch(() => {}); };
+    check();
+    setInterval(check, 15 * 60e3);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) check(); });
   }
 }
 function otherTab() {

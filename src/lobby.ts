@@ -42,7 +42,7 @@ export class Lobby extends Emitter {
   get secret() { return unb64(this.rec.secret); }
   get open() { const r = this.rec, n = now(); return !r.closed && !(r.invExp && n > r.invExp) && !(r.exp && n > r.exp); }
   children(): Room[] { return [...app.rooms.values()].filter(r => r.rec.lid === this.rec.id); }
-  save() { void db.put('lobbies', this.rec); }
+  save() { if (!(this.rec.kind === 'group' && this.rec.mode === 's')) void db.put('lobbies', this.rec); }
 
   async load() {
     for (const f of this.rec.files) {
@@ -95,7 +95,11 @@ export class Lobby extends Emitter {
       else if ((r.invExp && now() > r.invExp) || (r.exp && now() > r.exp)) code = 'exp';
       else if (this.children().length >= (r.kind === 'files' ? LOBBY_MAX_LIVE : LOBBY_MAX_CHATS)) code = 'full';
       if (code) { await this.nack(cs, cid, code); return; }
-      if (r.kind === 'chat') {
+      if (r.kind === 'group') {
+        r.n++;
+        this.save();
+        await app.make(cs, { role: 'h', mode: r.mode, name: t('member') + ' ' + r.n, exp: r.exp, lid: r.id, grp: r.id, hid: true });
+      } else if (r.kind === 'chat') {
         r.n++;
         this.save();
         await app.make(cs, { role: 'h', mode: r.mode, name: (r.name || t('device')) + ' ' + r.n, exp: r.mode === 'f' && r.life ? now() + r.life : 0, lid: r.id });
@@ -137,7 +141,9 @@ export class Lobby extends Emitter {
     this.stop();
     this.rec.closed = true;
     for (const r of this.children()) {
-      if (r.rec.share) { r.bye(true); r.stop(); app.removeRoom(r); } else { r.rec.lid = undefined; r.save(); }
+      if (r.rec.share) { r.bye(true); r.stop(); app.removeRoom(r); }
+      else if (r.rec.grp) void r.wipeAll();
+      else { r.rec.lid = undefined; r.save(); }
     }
     this.blobs.clear();
     await db.del('lobbies', this.rec.id);

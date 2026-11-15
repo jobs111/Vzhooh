@@ -1,6 +1,6 @@
 // Local persistence: IndexedDB for rooms/messages/files (fast mode only), localStorage for settings.
 export interface FileMeta { name: string; size: number; mime: string; tid: number; dur?: number; voice?: boolean }
-export interface Msg { id: string; mine: boolean; ts: number; text?: string; file?: FileMeta; st: 0 | 1 | 2; sys?: string; arg?: string; del?: number }
+export interface Msg { id: string; mine: boolean; ts: number; text?: string; file?: FileMeta; st: 0 | 1 | 2; from?: string; sys?: string; arg?: string; del?: number }
 export interface RoomRec {
   id: string; secret: string; role: 'h' | 'g'; mode: 'f' | 's'; name: string;
   created: number; exp: number; invExp: number; reusable: boolean;
@@ -13,11 +13,17 @@ export interface RoomRec {
   share?: boolean;                     // file-share room (temporary, both sides)
   call?: 'a' | 'v';                    // call room: the call starts by itself once the peer is here
   called?: boolean;                    // call room: the automatic call has already been made
+  hub?: string;                        // owner: the group chat itself (local room, id of its lobby)
+  grp?: string;                        // group member link (owner side: lobby id; member side: '1')
+  hid?: boolean;                       // not shown in lists (owner-side member links of a group)
+  synced?: boolean;                    // group member link: history already sent
+  fav?: boolean;                       // "Favourites": local notes of the owner
+  intro?: { sig?: string; exp: number; by?: string };   // room between two friends, opened by the owner
 }
 /** Multi-device invite: one link/QR, every device that opens it gets its own private room.
  *  kind 'chat' → a normal chat per device; kind 'files' → the devices download the shared files. */
 export interface LobbyRec {
-  id: string; secret: string; kind: 'chat' | 'files'; name: string; mode: 'f' | 's';
+  id: string; secret: string; kind: 'chat' | 'files' | 'group'; name: string; mode: 'f' | 's';
   created: number; exp: number; invExp: number; life: number; n: number;
   files: (FileMeta & { mem?: boolean })[]; note?: string; dl: number; closed?: boolean;
 }

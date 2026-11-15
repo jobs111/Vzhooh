@@ -1,7 +1,7 @@
 // A room = one 1:1 chat. Handles the encrypted handshake, the link (direct or relay),
 // reliable delivery, presence, chat messages and call state.
 import { app } from './app';
-import { aesKey, ecdh, ecdhGen, hkdf, hmac, KeyPair, ownerSign, ownerVerify, sasEmoji, seal, unseal } from './crypto';
+import { aesKey, ecdh, ecdhGen, hkdf, hmac, KeyPair, ownerSign, sasEmoji, verifyHost, seal, unseal } from './crypto';
 import { Xfer } from './files';
 import { sendJoin } from './lobby';
 import { localCodecs, RelayAudio } from './rcall';
@@ -11,7 +11,10 @@ import { conf, db, FileMeta, Msg, RoomRec } from './store';
 import { b64, canZ, concat, deflate, Emitter, eq, inflate, now, rnd, td, te, U8, unb64 } from './util';
 
 export const PROTO = 1;
+/** Feature level of this build (2 = relay calls, read receipts; 3 = groups, intros). Shown as a hint when the peer is older. */
+export const FEAT = 3;
 const PERSIST_MAX = 16 * 1024 * 1024;
+const FAV_MAX = 1024 * 1024 * 1024;
 type Op = Record<string, any>;
 const J = (o: Op) => concat([0], te.encode(JSON.stringify(o)));
 
@@ -57,7 +60,8 @@ export class Room extends Emitter {
   private gotCfg = false;
   private cfgIce?: RTCIceServer[];
   // host handshake
-  private pend?: { k: CryptoKey; kraw: U8; g: string; gn: string; resume: boolean; wl: U8; z: boolean };
+  private pend?: { k: CryptoKey; kraw: U8; g: string; gn: string; resume: boolean; wl: U8; z: boolean; fl: number };
+  peerFeat = FEAT;
   private curGn = '';
   // rtc
   private rtcGen = 0;
@@ -74,6 +78,10 @@ export class Room extends Emitter {
     this.ready = (async () => { this.kWire = await aesKey(await hkdf(secret, null, 'vz1/wire', 32)); })();
   }
   get host() { return this.rec.role === 'h'; }
+  /** Local rooms have no peer of their own: the owner's group chat (hub) and "Favourites". */
+  get local() { return !!(this.rec.hub || this.rec.fav); }
+  private links(): Room[] { return this.rec.hub ? [...app.rooms.values()].filter(r => r.rec.grp === this.rec.hub && r.host) : []; }
+  get members() { const l = this.links(); return { all: l.filter(r => r.rec.bound).length, on: l.filter(r => r.online).length }; }
   get direct() { return !!this.rtc?.dcReady; }
   get wireBuffered() { return app.wire.buffered; }
   private get inTopic() { return `vz/${this.rec.id}/${this.host ? 'h' : 'g'}`; }
@@ -93,6 +101,7 @@ export class Room extends Emitter {
   }
   start() {
     if (this.state !== 'off' || this.gone) return;
+    if (this.local) { this.state = 'up'; this.online = true; this.emit('state'); return; }
     this.state = 'wait'; this.reject = '';
     if (this.rec.paused) { this.rec.paused = false; this.save(); }
     this.enqueue(async () => {
@@ -147,7 +156,11 @@ export class Room extends Emitter {
     app.removeRoom(this);
     this.emit('closed', why);
   }
-  expire() { void this.wipeLocal(); this.stop(); app.removeRoom(this); this.emit('closed', 'expired'); }
+  expire() {
+    const l = this.rec.hub ? app.lobbies.get(this.rec.hub) : undefined;
+    void this.wipeLocal(); this.stop(); app.removeRoom(this); this.emit('closed', 'expired');
+    if (l) void app.removeLobby(l);
+  }
 
   // ---------- wire framing ----------
   async sendWire(stage: 0 | 1, pt: U8, bulk = false): Promise<number> {
@@ -219,7 +232,7 @@ export class Room extends Emitter {
   private async sendHi() {
     const hs = this.hs;
     if (!hs || hs.done || this.state === 'off') return;
-    const o: Op = { t: 'hi', v: PROTO, e: b64(hs.kp.pub), n: b64(hs.n), g: this.rec.g, z: canZ ? 1 : 0 };
+    const o: Op = { t: 'hi', v: PROTO, e: b64(hs.kp.pub), n: b64(hs.n), g: this.rec.g, z: canZ ? 1 : 0, fl: FEAT };
     if (this.rec.rk) o.r = b64((await hmac(unb64(this.rec.rk), concat(hs.kp.pub, hs.n))).subarray(0, 16));
     if (this.rec.lobby && this.rec.sub) await sendJoin(unb64(this.rec.lobby), unb64(this.rec.sub));
     await this.sendWire(0, J(o));
@@ -250,13 +263,15 @@ export class Room extends Emitter {
     if (o.t !== 'wl') return;
     const hpub = unb64(String(o.e)), hn = unb64(String(o.m));
     const tr = concat(te.encode('vz1/'), hs.n, hn, hs.kp.pub, hpub);
-    if (app.owner && !(o.s && await ownerVerify(unb64(app.owner.pub), unb64(String(o.s)), tr))) { this.fail('sig'); return; }
+    // rooms opened by the owner between two friends are trusted through the owner's own (encrypted) chat with each of them
+    if (app.owner && !this.rec.intro && !(o.s && await verifyHost(unb64(app.owner.pub), unb64(String(o.s)), tr, o))) { this.fail('sig'); return; }
     const kraw = await hkdf(await ecdh(hs.kp.priv, hpub), this.secret, tr, 32);
     hs.done = true;
     clearTimeout(this.hsTimer);
     this.kSess = await aesKey(kraw);
     this.sas = sasEmoji(await hkdf(kraw, null, 'vz1/sas', 3));
     this.peerZ = !!o.z && canZ;
+    this.peerFeat = +o.fl || 1;
     if (!o.b) { this.rec.rk = b64(await hkdf(kraw, null, 'vz1/resume', 32)); this.save(); }
     this.sendOk(0);
   }
@@ -274,13 +289,16 @@ export class Room extends Emitter {
     }
     if (!resume && this.rec.dead) { await no('rev'); return; }
     if (!resume && this.rec.invExp && now() > this.rec.invExp) { await no('exp'); return; }
-    if (app.owner && !app.ownerKey) return; // this device cannot prove it belongs to the owner
+    if (app.owner && !app.ownerKey && !this.rec.intro) return; // this device cannot prove it belongs to the owner
     const kp = await ecdhGen(), hn = rnd(8);
     const tr = concat(te.encode('vz1/'), gn, hn, gpub, kp.pub);
     const kraw = await hkdf(await ecdh(kp.priv, gpub), this.secret, tr, 32);
-    const wl: Op = { t: 'wl', e: b64(kp.pub), n: o.n, m: b64(hn), b: resume ? 1 : 0, z: canZ ? 1 : 0 };
-    if (app.ownerKey) wl.s = b64(await ownerSign(app.ownerKey, tr));
-    this.pend = { k: await aesKey(kraw), kraw, g: o.g, gn: o.n, resume, wl: J(wl), z: !!o.z && canZ };
+    const wl: Op = { t: 'wl', e: b64(kp.pub), n: o.n, m: b64(hn), b: resume ? 1 : 0, z: canZ ? 1 : 0, fl: FEAT };
+    if (app.ownerKey && !this.rec.intro) {
+      wl.s = b64(await ownerSign(app.ownerKey, tr));
+      if (app.cert) { wl.dk = app.cert.pub; wl.dc = app.cert.sig; wl.dx = app.cert.exp; }
+    }
+    this.pend = { k: await aesKey(kraw), kraw, g: o.g, gn: o.n, resume, wl: J(wl), z: !!o.z && canZ, fl: +o.fl || 1 };
     await this.sendWire(0, this.pend.wl);
   }
   /** Host: the guest proved it has the new key — switch to the new session. */
@@ -288,7 +306,7 @@ export class Room extends Emitter {
     const p = this.pend!;
     this.pend = undefined;
     this.teardown();
-    this.kSess = p.k; this.curGn = p.gn; this.peerZ = p.z;
+    this.kSess = p.k; this.curGn = p.gn; this.peerZ = p.z; this.peerFeat = p.fl;
     this.sas = sasEmoji(await hkdf(p.kraw, null, 'vz1/sas', 3));
     if (!p.resume) this.rec.bound = { g: p.g, rk: b64(await hkdf(p.kraw, null, 'vz1/resume', 32)) };
     this.save();
@@ -296,7 +314,7 @@ export class Room extends Emitter {
   }
   private sendCfg() {
     const r = this.rec;
-    this.send({ t: 'cfg', md: r.mode, ex: r.exp, tm: r.timer, nm: r.name, ic: app.customIce() || undefined, cr: r.call });
+    this.send({ t: 'cfg', md: r.mode, ex: r.exp, tm: r.timer, nm: r.grp ? app.rooms.get('hub-' + r.grp)?.rec.name || '' : r.name, ic: app.customIce() || undefined, cr: r.call, gp: r.grp ? 1 : undefined });
   }
   private sessionUp() {
     this.state = 'up';
@@ -308,6 +326,7 @@ export class Room extends Emitter {
     if (this.rec.dead) this.sendR({ t: 'wipe' }, undefined, ok => { if (ok) app.removeRoom(this); });
     if (this.host && this.rec.share && this.rec.lid) app.lobbies.get(this.rec.lid)?.serve(this);
     this.rdSent = '';
+    stats.add('session');
     this.emit('state');
     this.readNow();
     this.xfer.linkChanged();
@@ -321,6 +340,7 @@ export class Room extends Emitter {
     void this.sendWireJson(s);
   }
   sendR(op: Op, key?: string, done?: (ok: boolean) => void) {
+    if (this.local) { done?.(true); return; }
     if (op.i == null) op.i = '~' + (this.seq++).toString(36);
     if (key) for (const [id, e] of this.out) if (e.key === key) { clearTimeout(e.timer); this.out.delete(id); }
     this.out.set(op.i, { op, tries: 0, timer: 0, at: 0, key, done });
@@ -400,7 +420,9 @@ export class Room extends Emitter {
     if (this.direct) this.flush();
   }
   tick(t: number) {
-    if (this.state === 'up') {
+    if (this.local) {
+      if (this.rec.hub) this.setOnline(this.links().some(r => r.online));
+    } else if (this.state === 'up') {
       const dc = this.direct;
       if (t - this.lastPing > (dc ? 5000 : 20000)) { this.lastPing = t; this.send({ t: 'p' }); }
       if (dc && t - this.lastRx > 16000) this.rtc!.stale();
@@ -442,7 +464,11 @@ export class Room extends Emitter {
       case 'a': if (Array.isArray(o.i)) for (const i of o.i) this.acked(String(i)); break;
       case 'ok': if (this.host) this.sendCfg(); break;
       case 'cfg': if (!this.host) this.onCfg(o); break;
-      case 'go': if (this.host && !this.rtc) { this.rtcGen = 1; this.startRtc(); } break;
+      case 'go':
+        if (this.host && !this.rtc && !this.rec.grp) { this.rtcGen = 1; this.startRtc(); }   // group links connect directly only when a big file needs it
+        if (this.host && this.rec.grp) this.groupSync();
+        break;
+      case 'nk': if (this.host && this.rec.grp && typeof o.n === 'string') this.setNick(o.n); break;
       case 'by':
         this.lastRx = 0; this.setOnline(false);
         if (o.x && (this.rec.mode === 's' || (this.rec.share && this.host))) this.closeLocal('peer');
@@ -459,12 +485,14 @@ export class Room extends Emitter {
       case 'tm': this.rec.timer = Math.max(0, o.s | 0); this.save(); this.sysMsg('timer', String(this.rec.timer)); this.emit('state'); break;
       case 'sd': await this.rtcFor(o.g)?.onSd(o.d, o.q); break;
       case 'ic': await this.rtcFor(o.g)?.onIce(o.c); break;
-      case 'ri': if (this.host) { if (o.f) this.rtcTries = 0; this.rtcFailed(); } break;
+      case 'ri': if (this.host) { if (!this.rtc) { this.rtcGen = 1; this.startRtc(); } else { if (o.f) this.rtcTries = 0; this.rtcFailed(); } } break;
       case 'fg': void this.xfer.serve(o.f >>> 0, +o.o || 0, +o.l || 0); break;
       case 'fn': this.xfer.onNak(o.f >>> 0); break;
       case 'c': this.onCall(o); break;
       case 'dm': if (typeof o.m === 'string') this.removeMsg(o.m, false); break;
       case 'rd': if (typeof o.u === 'string') this.onRead(o.u); break;
+      case 'in': if (!this.host && !this.rec.intro) await app.introIn(o, this); break;
+      case 'iz': if (!this.host && typeof o.id === 'string') app.introEnd(o.id, this); break;
     }
   }
   private onCfg(o: Op) {
@@ -478,6 +506,7 @@ export class Room extends Emitter {
     if (typeof o.nm === 'string' && o.nm) r.name = o.nm.slice(0, 60);
     this.cfgIce = Array.isArray(o.ic) ? o.ic : undefined;
     if (o.cr === 'a' || o.cr === 'v') r.call = o.cr;
+    if (o.gp) { r.grp = '1'; const n = conf.get('nick', ''); if (n) this.sendR({ t: 'nk', n }); }
     if (r.tmp && r.pair) { r.tmp = false; app.pairDone(this); }
     this.save();
     if (first) this.sendR({ t: 'go' });
@@ -536,7 +565,7 @@ export class Room extends Emitter {
   // ---------- chat ----------
   private msgOp(m: Msg): Op {
     const f = m.file;
-    return { t: 'm', i: m.id, x: m.text, f: f && { n: f.name, s: f.size, y: f.mime, t: f.tid, d: f.dur, v: f.voice ? 1 : undefined } };
+    return { t: 'm', i: m.id, x: m.text, fr: m.from, f: f && { n: f.name, s: f.size, y: f.mime, t: f.tid, d: f.dur, v: f.voice ? 1 : undefined } };
   }
   private addMsg(m: Msg) {
     if (this.rec.timer > 0 && !m.sys) m.del = now() + this.rec.timer * 1000;
@@ -554,9 +583,65 @@ export class Room extends Emitter {
     text = text.trim();
     if (!text) return;
     const m: Msg = { id: b64(rnd(6)), mine: true, ts: now(), text: text.slice(0, 20000), st: 0 };
+    if (this.local) m.st = 1;
     this.addMsg(m);
     stats.add('msgOut');
-    if (this.state === 'up') this.sendR(this.msgOp(m));
+    if (this.rec.hub) this.fanOut(m);
+    else if (this.state === 'up') this.sendR(this.msgOp(m));
+  }
+  // ---------- groups: the owner's device is the hub ----------
+  private get hubRoom(): Room | undefined { return this.rec.grp && this.host ? app.rooms.get('hub-' + this.rec.grp) : undefined; }
+  /** Hub → every member link (except the one the message came from). */
+  private fanOut(m: Msg, except?: Room, blob?: Blob) {
+    const b = blob || (m.file ? this.xfer.out.get(m.file.tid)?.blob || this.xfer.inc.get(m.file.tid)?.blob : undefined);
+    for (const l of this.links()) if (l !== except && l.rec.bound) l.fwd(m, b);
+  }
+  /** Member link: pass one group message on to this member. */
+  fwd(m: Msg, blob?: Blob) {
+    if (m.sys || this.msgs.some(x => x.arg === m.id)) return;
+    const c: Msg = { id: b64(rnd(6)), mine: true, ts: m.ts, st: 0, text: m.text, from: m.from || app.myName, arg: m.id };
+    if (m.file) { c.file = { ...m.file }; if (blob) this.xfer.offer(m.file.tid, blob); }
+    this.addMsg(c);
+    if (this.state === 'up') this.sendR(this.msgOp(c));
+  }
+  /** A new member is connected: send the group's history once. */
+  private groupSync() {
+    const hub = this.hubRoom;
+    if (!hub || this.rec.synced) return;
+    this.rec.synced = true; this.save();
+    hub.sysMsg('joined', this.rec.name);
+    for (const m of hub.msgs.slice(-300)) if (m.arg !== this.rec.id) this.fwd(m, m.file ? hub.xfer.out.get(m.file.tid)?.blob || hub.xfer.inc.get(m.file.tid)?.blob : undefined);
+  }
+  private setNick(n: string) {
+    n = n.replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, 24);
+    if (!n || n === this.rec.name) return;
+    this.rec.name = n; this.save(); app.emit('rooms');
+  }
+  /** Owner side: a member's message arrived on its link → show it in the group and pass it to the others. */
+  private groupIn(m: Msg) {
+    const hub = this.hubRoom;
+    if (!hub || hub.msgs.some(x => x.id === m.id)) return;
+    const deliver = (blob?: Blob) => {
+      if (hub.msgs.some(x => x.id === m.id)) return;
+      const hm: Msg = { id: m.id, mine: false, ts: now(), st: 1, text: m.text, file: m.file && { ...m.file }, from: this.rec.name, arg: this.rec.id };
+      if (hm.file && blob) { hub.xfer.restore(hm, blob); hub.persistBlob(hm.file.tid, blob); }
+      hub.pushIn(hm);
+      hub.fanOut(hm, this, blob);
+    };
+    if (!m.file) { deliver(); return; }
+    const tid = m.file.tid;
+    this.xfer.ensure(m);
+    const off = this.on('file', (t2: number) => {
+      const i = this.xfer.inc.get(tid);
+      if (t2 === tid && i?.state === 'done' && i.blob) { off(); deliver(i.blob); }
+    });
+    this.xfer.fetch(tid);
+  }
+  /** Add an incoming message to this (hub) room. */
+  pushIn(m: Msg) {
+    if (app.active !== this.rec.id || document.hidden) this.rec.unread++;
+    this.addMsg(m);
+    app.notify(this);
   }
   sendFile(blob: Blob, name: string, extra?: { voice?: boolean; dur?: number }) {
     const tid = new DataView(rnd(4).buffer).getUint32(0);
@@ -565,8 +650,10 @@ export class Room extends Emitter {
     const m: Msg = { id: b64(rnd(6)), mine: true, ts: now(), st: 0, file };
     this.persistBlob(tid, blob);
     stats.add('fileOut'); stats.add('fileOutBytes', blob.size);
+    if (this.local) m.st = 1;
     this.addMsg(m);
-    if (this.state === 'up') this.sendR(this.msgOp(m));
+    if (this.rec.hub) this.fanOut(m, undefined, blob);
+    else if (this.state === 'up') this.sendR(this.msgOp(m));
   }
   /** Offer an existing blob under a known id (file-share rooms). */
   offerFile(meta: FileMeta, blob: Blob) {
@@ -574,6 +661,21 @@ export class Room extends Emitter {
     const m: Msg = { id: b64(rnd(6)), mine: true, ts: now(), st: 0, file: { ...meta } };
     this.addMsg(m);
     if (this.state === 'up') this.sendR(this.msgOp(m));
+  }
+  /** Favourites: how long to keep one item (0 = until deleted). */
+  setKeep(id: string, ms: number) {
+    const m = this.msgs.find(x => x.id === id);
+    if (!m) return;
+    m.del = ms ? now() + ms : undefined;
+    this.persistMsg(m); this.emit('msg', m);
+  }
+  /** Member: (re)send my display name to the group. */
+  sendNick() { const n = conf.get('nick', ''); if (n && this.rec.grp && !this.host && this.state === 'up') this.sendR({ t: 'nk', n }); }
+  /** Direct link wanted (a big file is waiting). */
+  needDirect() {
+    if (this.state !== 'up' || this.direct || app.noP2P) return;
+    if (this.host) { if (!this.rtc) { this.rtcGen = 1; this.startRtc(); } }
+    else if (!this.rtc && now() - this.riAt > 5000) { this.riAt = now(); this.send({ t: 'ri', f: 1 }); }
   }
   /** Delete one message here; with forAll (own messages only) also on the peer's device. */
   deleteMsg(id: string, forAll: boolean) {
@@ -601,6 +703,8 @@ export class Room extends Emitter {
         tid: f.t >>> 0, dur: +f.d || undefined, voice: !!f.v };
     }
     if (!m.text && !m.file) return;
+    if (typeof o.fr === 'string' && !this.host) m.from = o.fr.slice(0, 40);
+    if (this.host && this.rec.grp) { this.msgs.push(m); this.persistMsg(m); stats.add(m.file ? 'fileIn' : 'msgIn'); this.groupIn(m); return; }
     if (m.file && this.msgs.some(x => !x.mine && x.file?.tid === m.file!.tid)) return;   // the same file offered again
     if (this.rec.share && m.text && this.msgs.some(x => !x.mine && x.text === m.text)) return;
     if (app.active !== this.rec.id || document.hidden) this.rec.unread++;
@@ -610,12 +714,15 @@ export class Room extends Emitter {
     app.notify(this);
   }
   persistBlob(tid: number, blob: Blob) {
-    if (this.rec.mode === 'f' && !this.rec.tmp && !this.gone && blob.size <= PERSIST_MAX) {
+    if (this.host && this.rec.grp) return;   // the hub keeps the group's files
+    if (this.rec.mode === 'f' && !this.rec.tmp && !this.gone && blob.size <= (this.rec.fav ? FAV_MAX : PERSIST_MAX)) {
       void db.put('blobs', { k: this.rec.id + '|' + tid, room: this.rec.id, blob });
     }
   }
   async loadBlob(tid: number): Promise<Blob | undefined> {
     if (this.rec.mode !== 'f') return undefined;
+    const hub = this.hubRoom;
+    if (hub) return hub.xfer.out.get(tid)?.blob || hub.xfer.inc.get(tid)?.blob || hub.loadBlob(tid);
     return (await db.get<{ blob: Blob }>('blobs', this.rec.id + '|' + tid))?.blob;
   }
   private dropFile(tid: number) { this.xfer.drop(tid); void db.del('blobs', this.rec.id + '|' + tid); }
@@ -659,6 +766,14 @@ export class Room extends Emitter {
   }
   /** "Delete everything": wipe both sides. If the peer is unreachable, remember to deliver the wipe later. */
   async wipeAll() {
+    if (this.rec.fav) { await this.wipeLocal(); return; }
+    if (this.rec.hub) {
+      const l = app.lobbies.get(this.rec.hub);
+      await this.wipeLocal(); this.stop(); app.removeRoom(this);
+      if (l) await app.removeLobby(l);
+      this.emit('closed', 'self');
+      return;
+    }
     const hadPeer = this.host ? !!this.rec.bound : !!this.rec.rk;
     let delivered = false;
     if (this.state === 'up' && this.online) {

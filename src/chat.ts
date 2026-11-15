@@ -3,8 +3,10 @@ import { app } from './app';
 import { RELAY_MAX, safeMime, startDownload } from './files';
 import { t } from './i18n';
 import { inviteUrl } from './invite';
+import { FEAT } from './room';
 import type { Room } from './room';
 import { ring } from './sound';
+import { conf } from './store';
 import type { Msg } from './store';
 import { inviteBlock, shareGuestView } from './tools';
 import { copyText, go, mount, netBar, roomStatus, roomTitle, toast } from './ui';
@@ -32,7 +34,7 @@ export function chatView(room: Room) {
   const off: (() => void)[] = [];
   const els = new Map<string, HTMLElement>();
   const list = h('div.msgs', { id: 'msgs' });
-  const dot = h('span.dot'), sub = h('div.sub');
+  const dot = h('span.dot'), sub = h('div.sub'), nameEl = h('span');
   const banner = h('div.banner');
   const menu = h('div.menu', { hidden: true });
   const panel = h('div.panel', { hidden: true });
@@ -44,7 +46,7 @@ export function chatView(room: Room) {
   const sysText = (m: Msg) => {
     if (m.sys === 'timer') return t('sys_timer', timerLabel(+(m.arg || 0)));
     if (m.sys === 'call_ended') return t('sys_call_ended', fmtDur(+(m.arg || 0)));
-    return t('sys_' + m.sys);
+    return t('sys_' + m.sys, m.arg || '');
   };
   const lightbox = (url: string) => {
     const box = h('div.lightbox', { onclick: () => box.remove() }, h('img', { src: url, alt: '' }));
@@ -94,6 +96,7 @@ export function chatView(room: Room) {
   const render = (m: Msg): HTMLElement => {
     if (m.sys) return h('div.sys', sysText(m));
     const el = h('div.msg' + (m.mine ? '.me' : ''),
+      m.from && !m.mine ? h('div.from', m.from) : null,
       m.text ? h('div.txt', linkify(m.text)) : null,
       m.file ? fileEl(m) : null,
       h('div.meta', m.del ? '⏱ ' : '', fmtClock(m.ts), m.mine ? (m.st === 2 ? h('span.tick.read', { title: t('read') }, ' ✓✓') : m.st ? h('span.tick', { title: t('delivered') }, ' ✓') : ' 🕓') : ''));
@@ -144,10 +147,14 @@ export function chatView(room: Room) {
     const m = room.msgs.find(x => x.id === el.dataset.id);
     if (!m) return;
     const act = (label: string, fn: () => void, cls = '') => h('button' + cls, { onclick: (ev: Event) => { ev.stopPropagation(); closeAct(); fn(); } }, label);
+    const fav = !!room.rec.fav, DAY = 24 * 3600e3;
     const pop = h('div.mact', { role: 'menu' },
       m.text ? act('📋 ' + t('mCopy'), () => void copyText(m.text!)) : null,
-      m.mine ? act('🗑 ' + t('mDelAll'), () => room.deleteMsg(m.id, true), '.danger') : null,
-      act('✕ ' + t('mDelMe'), () => room.deleteMsg(m.id, false)));
+      fav ? act('⏱ ' + t('keep24'), () => room.setKeep(m.id, DAY)) : null,
+      fav ? act('⏱ ' + t('keep48'), () => room.setKeep(m.id, 2 * DAY)) : null,
+      fav && m.del ? act('∞ ' + t('keepInf'), () => room.setKeep(m.id, 0)) : null,
+      m.mine && !room.local && !room.rec.grp ? act('🗑 ' + t('mDelAll'), () => room.deleteMsg(m.id, true), '.danger') : null,
+      act('✕ ' + t(fav ? 'delete' : 'mDelMe'), () => room.deleteMsg(m.id, false)));
     document.body.append(pop);
     const r = el.getBoundingClientRect(), pw = pop.offsetWidth, ph = pop.offsetHeight;
     pop.style.left = Math.max(8, Math.min(innerWidth - pw - 8, m.mine ? r.right - pw : r.left)) + 'px';
@@ -161,24 +168,27 @@ export function chatView(room: Room) {
   const callV = h('button.ic', { title: t('videoCall'), onclick: () => void startCall(true) }, '🎥') as HTMLButtonElement;
   const drawInvite = () => {
     const r = room.rec;
-    const can = room.host && !r.pair && !r.lid && (!r.bound || r.reusable) && (!r.invExp || now() < r.invExp);
-    const want = can && (showInvite || (!r.bound && room.state !== 'up'));
+    const lob = r.hub ? app.lobbies.get(r.hub) : undefined;
+    const can = lob ? lob.open : room.host && !room.local && !r.pair && !r.lid && (!r.bound || r.reusable) && (!r.invExp || now() < r.invExp);
+    const want = can && (showInvite || (lob ? room.members.all === 0 : !r.bound && room.state !== 'up'));
     if (!want) { panel.hidden = true; panel.replaceChildren(); return; }
     if (!panel.hidden && panel.childElementCount) return;
-    const url = inviteUrl('j', app.invite(room));
+    const url = inviteUrl('j', lob ? app.lobbyInvite(lob) : app.invite(room));
     panel.hidden = false;
     panel.replaceChildren(...[
       h('h2', r.call ? t('callTitle') : t('inviteTitle')),
       r.call ? h('p.note', t('callWait')) : null,
-      h('p.hint', t(r.reusable ? 'inviteHintN' : 'inviteHint1') + (r.invExp ? ' ' + t('inviteUntil', new Date(r.invExp).toLocaleString()) : '')),
+      h('p.hint', t(lob ? 'groupHint' : r.reusable ? 'inviteHintN' : 'inviteHint1') + (!lob && r.invExp ? ' ' + t('inviteUntil', new Date(r.invExp).toLocaleString()) : '')),
       inviteBlock(url, 'invite-url', roomTitle(room)),
-      r.bound ? h('button', { onclick: () => { showInvite = false; drawInvite(); } }, t('close')) : null].filter(Boolean) as Node[]);
+      r.bound || (lob && room.members.all) ? h('button', { onclick: () => { showInvite = false; drawInvite(); } }, t('close')) : null].filter(Boolean) as Node[]);
   };
   const drawState = () => {
     const st = roomStatus(room);
     dot.className = 'dot ' + st.cls;
+    nameEl.textContent = roomTitle(room);
     sub.textContent = st.text + (room.rec.mode === 's' ? ' · 🔒' : '') + (room.rec.exp ? ' · ' + t('until', new Date(room.rec.exp).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })) : '');
     callA.disabled = callV.disabled = room.state !== 'up' || !room.online;
+    callA.hidden = callV.hidden = room.local || !!room.rec.grp;
     banner.replaceChildren();
     if (room.reject) banner.append(h('p.err', t('rj_' + (['used', 'exp', 'rev', 'ver', 'sig', 'full'].includes(room.reject) ? room.reject : 'no'))));
     else if (room.state === 'off') banner.append(h('button.primary', { onclick: () => room.start() }, t('connect')));
@@ -186,6 +196,7 @@ export function chatView(room: Room) {
     else if (room.host && !room.rec.bound && room.rec.invExp && now() > room.rec.invExp) {
       banner.append(h('p.err', t('inviteExpired')), h('button', { onclick: () => { room.rec.invExp = now() + 3600e3; room.save(); drawState(); } }, t('extend')));
     } else if (!room.host && room.rec.call && room.state === 'up' && room.call.st === 'idle' && !room.rec.called) banner.append(h('p.hint', t('callGuestWait')));
+    if (room.state === 'up' && room.peerFeat < FEAT) banner.append(h('p.hint', t('peerOld')));
     banner.hidden = !banner.childElementCount;
     drawInvite();
     autoCall();
@@ -207,16 +218,18 @@ export function chatView(room: Room) {
   const drawMenu = () => {
     const r = room.rec;
     menu.replaceChildren(...([
-      room.host && !r.pair && !r.lid && (!r.bound || r.reusable) ? item('🔗 ' + t('showInvite'), () => { showInvite = true; panel.replaceChildren(); drawInvite(); }) : null,
+      r.hub || (room.host && !room.local && !r.pair && !r.lid && (!r.bound || r.reusable)) ? item('🔗 ' + t('showInvite'), () => { showInvite = true; panel.replaceChildren(); drawInvite(); }) : null,
+      r.hub ? item('👥 ' + t('membersN', room.members.on, room.members.all), () => go('adm')) : null,
+      r.grp && !room.host ? item('✏ ' + t('myName'), () => { const n = prompt(t('myName'), conf.get('nick', '')); if (n != null) { conf.set('nick', n.trim().slice(0, 24)); room.sendNick(); } }) : null,
       room.sas ? item('🛡 ' + t('sasTitle'), () => alert(t('sasTitle') + ':\n\n' + room.sas + '\n\n' + t('sasHint'))) : null,
       r.mode === 's' ? h('label.mi', '⏱ ' + t('timer') + ' ', (() => {
         const s = h('select', [0, 30, 300, 600, 3600].map(v => h('option', { value: String(v), selected: v === r.timer }, timerLabel(v)))) as HTMLSelectElement;
         s.onchange = () => { room.setTimer(+s.value); menu.hidden = true; };
         return s;
       })()) : null,
-      room.state === 'up' && !room.direct ? item('⚡ ' + t('retry'), () => room.retryDirect()) : null,
-      room.state !== 'off' ? item('⏏ ' + t('disconnect'), () => { if (r.mode !== 's' || confirm(t('discAskS'))) room.disconnect(); }) : null,
-      item('🗑 ' + t('wipe'), () => { if (confirm(t('wipeAsk'))) void room.wipeAll(); }, '.danger')].filter(Boolean) as Node[]));
+      room.state === 'up' && !room.direct && !room.local && !r.grp ? item('⚡ ' + t('retry'), () => room.retryDirect()) : null,
+      room.state !== 'off' && !room.local ? item('⏏ ' + t('disconnect'), () => { if (r.mode !== 's' || confirm(t('discAskS'))) room.disconnect(); }) : null,
+      item('🗑 ' + t(r.fav ? 'favClear' : r.hub ? 'grpDel' : r.grp ? 'grpLeave' : 'wipe'), () => { if (confirm(t(r.fav ? 'favClearAsk' : r.hub ? 'grpDelAsk' : r.grp ? 'grpLeaveAsk' : 'wipeAsk'))) void room.wipeAll(); }, '.danger')].filter(Boolean) as Node[]));
   };
 
   // ----- composer -----
@@ -363,7 +376,7 @@ export function chatView(room: Room) {
   mount(h('div.page.chat',
     h('header.bar',
       h('button.ic', { onclick: () => go(''), 'aria-label': t('back') }, '←'),
-      h('div.grow', h('div.ttl', dot, ' ', roomTitle(room)), sub),
+      h('div.grow', h('div.ttl', dot, ' ', nameEl), sub),
       callA, callV,
       h('button.ic', { id: 'menu-btn', onclick: () => { drawMenu(); menu.hidden = !menu.hidden; } }, '⋮')),
     menu, netBar(off), banner, panel, list, recBar,

@@ -19,7 +19,7 @@ export interface Inc {
   sink?: { write(d: BufferSource): Promise<void>; close(): Promise<void> }; sinkQ: Promise<void>;
   blob?: Blob; url?: string; saved?: boolean;
 }
-export interface Out { blob: Blob; gen: number; sent: number; url?: string }
+export interface Out { blob: Blob; gen: number; sent: number; at: number; url?: string }
 
 export class Xfer {
   out = new Map<number, Out>();
@@ -27,7 +27,13 @@ export class Xfer {
   private lastEmit = new Map<number, number>();
   constructor(private room: Room) {}
 
-  offer(tid: number, blob: Blob) { this.out.set(tid, { blob, gen: 0, sent: 0 }); }
+  /** A transfer is running right now (do not reload the app). */
+  get busy() {
+    for (const i of this.inc.values()) if (i.state === 'run') return true;
+    for (const o of this.out.values()) if (o.sent > 0 && o.sent < o.blob.size && now() - o.at < 15000) return true;
+    return false;
+  }
+  offer(tid: number, blob: Blob) { this.out.set(tid, { blob, gen: 0, sent: 0, at: 0 }); }
 
   ensure(m: Msg): Inc {
     const f = m.file!;
@@ -57,7 +63,7 @@ export class Xfer {
   private request(i: Inc) {
     const r = this.room;
     const dc = r.direct;
-    if (r.state !== 'up' || (!dc && i.size > RELAY_MAX)) { i.state = 'wait'; this.changed(i.tid); return; }
+    if (r.state !== 'up' || (!dc && i.size > RELAY_MAX)) { i.state = 'wait'; r.needDirect(); this.changed(i.tid); return; }
     i.viaDc = dc; i.state = 'run'; i.last = now();
     i.winEnd = dc ? i.size : Math.min(i.size, i.got + i.win);
     r.send({ t: 'fg', f: i.tid, o: i.got, l: dc ? 0 : i.winEnd - i.got });
@@ -124,7 +130,7 @@ export class Xfer {
     let e = this.out.get(tid);
     if (!e) {
       const b = await r.loadBlob(tid);
-      if (b) { e = { blob: b, gen: 0, sent: 0 }; this.out.set(tid, e); }
+      if (b) { e = { blob: b, gen: 0, sent: 0, at: 0 }; this.out.set(tid, e); }
     }
     if (!e || !(from >= 0) || from > e.blob.size) { r.send({ t: 'fn', f: tid }); return; }
     const gen = ++e.gen, size = e.blob.size;
@@ -151,7 +157,7 @@ export class Xfer {
         }
       }
       off = sliceEnd;
-      e.sent = Math.max(e.sent, off);
+      e.sent = Math.max(e.sent, off); e.at = now();
       this.changed(tid, true);
     }
     if (off >= size) { e.sent = size; this.changed(tid); }

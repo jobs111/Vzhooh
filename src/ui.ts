@@ -1,5 +1,6 @@
 // App shell: router, home screen, forms, settings.
 import { app, VERSION } from './app';
+import { adminGrantView, adminQrBlock, adminView, statsView } from './admin';
 import { chatView } from './chat';
 import { ownerCreate, ownerUnlock } from './crypto';
 import { diagView } from './diag';
@@ -61,8 +62,10 @@ export function netBar(off: (() => void)[]): HTMLElement {
   return el;
 }
 
-export function roomTitle(r: Room) { return r.rec.name || (r.rec.pair ? t('device') : t('chatN')); }
+export function roomTitle(r: Room) { return r.rec.fav ? '⭐ ' + t('fav') : r.rec.name || (r.rec.pair ? t('device') : r.rec.hub || r.rec.grp ? t('group') : t('chatN')); }
 export function roomStatus(r: Room): { text: string; cls: string } {
+  if (r.rec.fav) return { text: t('favSub'), cls: 'on' };
+  if (r.rec.hub) { const m = r.members; return { text: t('grpOn', m.on, m.all), cls: m.on ? 'on' : 'wait' }; }
   if (r.reject) return { text: t('stOffline'), cls: 'off' };
   if (r.state === 'off') return { text: t('stPaused'), cls: 'off' };
   if (app.wire.down) return { text: t('stReconnect'), cls: 'wait' };
@@ -85,11 +88,15 @@ export async function route() {
   if (k === 'r') {
     const r = app.rooms.get(v);
     if (r && !r.rec.dead) { chatView(r); return; }
+    if (v === 'fav' && app.isAdmin) { chatView(app.fav); return; }
     const sh = sessionStorage.getItem('vz.sh.' + v);   // a file-download page was reloaded: join the share again
     if (sh) { sessionStorage.removeItem('vz.sh.' + v); await joinBy(sh); return; }
     go('', true); return;
   }
   if (k === 'l') { const l = app.lobbies.get(v); if (l) { lobbyView(l); return; } go('', true); return; }
+  if (k === 'a' && v) { history.replaceState(null, '', location.pathname + location.search); adminGrantView(v); return; }
+  if (k === 'adm') { adminView(); return; }
+  if (k === 'stat') { statsView(); return; }
   if (k === 'new') { newChatView(); return; }
   if (k === 'share') { shareCreateView(); return; }
   if (k === 'call') { callRoomView(); return; }
@@ -125,11 +132,13 @@ function homeView() {
   const draw = () => {
     net.className = 'dot ' + (app.wire.upCount ? 'on' : 'wait');
     const rooms = app.visibleRooms;
-    list.replaceChildren(...(rooms.length ? rooms.map(r => {
+    const favRow = app.isAdmin ? [h('button.room.fav', { onclick: () => { void app.fav; go('r=fav'); }, id: 'fav-row' }, h('span.lic', '⭐'),
+      h('div.grow', h('div.name', t('fav')), h('div.sub', t('favSub'))))] : [];
+    list.replaceChildren(...favRow, ...(rooms.length ? rooms.map(r => {
       const st = roomStatus(r), last = [...r.msgs].reverse().find(x => !x.sys);
       return h('button.room', { onclick: () => go('r=' + r.rec.id) },
         h('span.dot.' + st.cls),
-        h('div.grow', h('div.name', (r.rec.mode === 's' ? '🔒 ' : '') + (r.rec.call ? '📞 ' : '') + roomTitle(r)),
+        h('div.grow', h('div.name', (r.rec.mode === 's' ? '🔒 ' : '') + (r.rec.call ? '📞 ' : '') + (r.rec.hub || r.rec.grp ? '👥 ' : '') + roomTitle(r)),
           h('div.sub', last ? (last.text || (last.file?.voice ? '🎤' : '📎 ' + (last.file?.name || ''))).slice(0, 60) : st.text)),
         r.rec.unread ? h('span.badge', String(r.rec.unread)) : null,
         last ? h('span.time', fmtClock(last.ts)) : null);
@@ -165,11 +174,15 @@ function homeView() {
     off.push(() => { clearInterval(refresh); app.pairStop(); }, app.on('paired', (r: Room) => go('r=' + r.rec.id)));
     pair.append(h('section.card', h('h2', t('pairTitle')), h('p.hint', t('pairHint')), qr, h('p.hint.c', t('pairWait'))));
   }
+  const mi = (label: string, hash: string) => h('button', { onclick: () => go(hash) }, label);
+  const hm = h('div.menu', { hidden: true }, ...[
+    app.isAdmin ? mi('🔌 ' + t('admTitle'), 'adm') : null, app.isAdmin ? mi('📊 ' + t('stTitle'), 'stat') : null,
+    mi('⚙ ' + t('settings'), 'set'), mi('🩺 ' + t('diag'), 'diag')].filter(Boolean) as Node[]);
   const act = (icon: string, label: string, hash: string, id: string) => h('button.act', { onclick: () => go(hash), id }, h('span.aic', icon), h('span', label));
   mount(h('div.page',
-    h('header.bar', h('div.ttl.big', t('app'), ' ', net), h('button.ic', { onclick: () => go('diag'), title: t('diag') }, '🩺'),
-      h('button.ic', { onclick: () => go('set'), title: t('settings') }, '⚙')),
-    h('main.body',
+    h('header.bar', h('div.ttl.big', t('app'), ' ', net), h('button.ic', { id: 'home-menu', onclick: () => { hm.hidden = !hm.hidden; }, 'aria-label': 'menu' }, '⋮')),
+    hm,
+    h('main.body', { onclick: () => { hm.hidden = true; } },
       netBar(off),
       !app.owner ? h('p.note', t('unclaimed')) : null,
       app.isAdmin ? h('div.acts',
@@ -185,7 +198,7 @@ function homeView() {
 // ---------- new chat ----------
 function newChatView() {
   if (!app.isAdmin) { go('own', true); return; }
-  let secure = false, many = false;
+  let secure = false, many = false, group = false;
   const name = h('input', { type: 'text', maxLength: 40, placeholder: t('chatN') }) as HTMLInputElement;
   const life = sel([[HOUR, t('h1')], [24 * HOUR, t('h24')], [48 * HOUR, t('h48')]], 48 * HOUR);
   const inv = sel([[10 * 60e3, t('m10')], [HOUR, t('h1')], [24 * HOUR, t('h24')], [7 * 24 * HOUR, t('d7')], [0, t('forever')]], HOUR);
@@ -193,27 +206,31 @@ function newChatView() {
   const lifeF = field(t('life'), life);
   const bF = h('button.seg', { onclick: () => { secure = false; upd(); } }, '⚡ ' + t('fast'));
   const bS = h('button.seg', { onclick: () => { secure = true; upd(); } }, '🔒 ' + t('secure'));
-  const b1 = h('button.seg', { onclick: () => { many = false; upd(); } }, '👤 ' + t('whoOne'));
-  const bN = h('button.seg', { onclick: () => { many = true; upd(); }, id: 'who-many' }, '👥 ' + t('whoMany'));
+  const b1 = h('button.seg', { onclick: () => { many = false; group = false; upd(); } }, '👤 ' + t('whoOne'));
+  const bN = h('button.seg', { onclick: () => { many = true; group = false; upd(); }, id: 'who-many' }, '🖥 ' + t('whoMany'));
+  const bG = h('button.seg', { onclick: () => { many = false; group = true; upd(); }, id: 'who-group' }, '👥 ' + t('group'));
+  const invF = field(t('invTtl'), inv);
   const upd = () => {
     bF.classList.toggle('sel', !secure); bS.classList.toggle('sel', secure);
-    b1.classList.toggle('sel', !many); bN.classList.toggle('sel', many);
+    b1.classList.toggle('sel', !many && !group); bN.classList.toggle('sel', many); bG.classList.toggle('sel', group);
     modeHint.textContent = t(secure ? 'secureHint' : 'fastHint');
-    whoHint.textContent = t(many ? 'whoManyHint' : 'whoOneHint');
-    lifeF.hidden = secure;
+    whoHint.textContent = t(group ? 'whoGroupHint' : many ? 'whoManyHint' : 'whoOneHint');
+    lifeF.hidden = secure && !group;
+    invF.hidden = group;
   };
   upd();
   const create = h('button.primary.wide', t('create')) as HTMLButtonElement;
   create.onclick = async () => {
     create.disabled = true;
     const o = { name: name.value.trim(), secure, life: +life.value, invTtl: +inv.value };
-    if (many) { const l = await app.createLobby({ kind: 'chat', ...o }); go('l=' + l.rec.id, true); }
+    if (group) { const l = await app.createLobby({ kind: 'group', ...o, name: o.name || t('group') }); go('r=hub-' + l.rec.id, true); }
+    else if (many) { const l = await app.createLobby({ kind: 'chat', ...o }); go('l=' + l.rec.id, true); }
     else { const r = await app.createRoom(o); go('r=' + r.rec.id, true); }
   };
   mount(h('div.page', bar(t('newChat')), h('main.body',
     h('div.segs', bF, bS), modeHint,
-    h('span.lbl', t('who')), h('div.segs', b1, bN), whoHint,
-    field(t('roomName'), name), lifeF, field(t('invTtl'), inv), create)));
+    h('span.lbl', t('who')), h('div.segs', b1, bN, bG), whoHint,
+    field(t('roomName'), name), lifeF, invF, create)));
 }
 
 // ---------- pairing: owner accepts a device ----------
@@ -243,15 +260,16 @@ function ownerView() {
     btn.disabled = false;
     if (!key) { toast(t('badPass')); return; }
     await app.setOwnerKey(key, rem.checked);
-    const p = sessionStorage.getItem('vz.pair');
-    sessionStorage.removeItem('vz.pair');
-    if (p) pairClaimView(p); else go('', true);
+    const p = sessionStorage.getItem('vz.pair'), g = sessionStorage.getItem('vz.grant');
+    sessionStorage.removeItem('vz.pair'); sessionStorage.removeItem('vz.grant');
+    if (g) adminGrantView(g); else if (p) pairClaimView(p); else go('', true);
   };
+  const qr = adminQrBlock(() => { toast(t('ownerIn')); go('', true); });
   btn.onclick = submit;
   pass.onkeydown = e => { if (e.key === 'Enter') void submit(); };
   mount(h('div.page', bar(t('ownerLogin')), h('main.body',
-    h('p.hint', t('needOwner')), field(t('pass'), pass), h('label.check', rem, h('span', t('remember'))), btn)));
-  pass.focus();
+    h('p.hint', t('needOwner')), field(t('pass'), pass), h('label.check', rem, h('span', t('remember'))), btn, qr.el)), [qr.stop]);
+  if (!matchMedia('(pointer: coarse)').matches) pass.focus();
 }
 
 // ---------- settings ----------
@@ -294,13 +312,14 @@ function settingsView() {
     } }, t('claimDo')) as HTMLButtonElement;
     own.append(h('h2', t('claimTitle')), h('p.hint', t('claimHint')), field(t('pass'), p1), field(t('pass2'), p2), b, outBox);
   } else if (app.ownerKey) {
-    own.append(h('h2', '👑 ' + t('ownerIn')), h('button', { onclick: async () => { await app.setOwnerKey(null, false); go('', true); } }, t('ownerOut')));
+    own.append(h('h2', '👑 ' + t('ownerIn')), app.cert ? h('p.hint', t('aqUntil', new Date(app.cert.exp).toLocaleDateString())) : h('p.hint', t('aqHow')), h('button', { onclick: async () => { await app.setOwnerKey(null, false); go('', true); } }, t('ownerOut')));
   } else own.append(h('button', { onclick: () => go('own') }, t('ownerLogin')));
 
   mount(h('div.page', bar(t('settings')), h('main.body',
     field(t('lang'), lng),
     h('label.check', low, h('span', t('lowData'))),
     h('label.check', rr, h('span', t('readRcpt'))),
+    field(t('myName'), (() => { const i = h('input', { type: 'text', maxLength: 24, value: conf.get('nick', ''), placeholder: 'Админ' }) as HTMLInputElement; i.onchange = () => conf.set('nick', i.value.trim()); return i; })()),
     own,
     h('details', h('summary', '🛠 ' + t('diag') + ' / network'),
       field(t('antiFreeze'), af),

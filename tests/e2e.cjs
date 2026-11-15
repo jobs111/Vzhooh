@@ -134,7 +134,7 @@ const tests = {
     await host.screenshot({ path: path.join(OUT, 'home-host.png') });
     // XSS probe: hostile file name and type must stay inert
     await g2.evaluate(() => { const r = [...__vz.rooms.values()][0]; r.sendFile(new Blob(['<script>window.__pwn=1</script><svg onload="window.__pwn=1">'], { type: 'text/html' }), '<img src=x onerror=window.__pwn=1>.html'); r.sendText('<img src=x onerror=window.__pwn=1>'); });
-    await host.click('.room >> nth=0');
+    await host.click('.room:not(.fav) >> nth=0');
     const types = await until(() => host.evaluate(() => { const t = [...__vz.rooms.values()].flatMap(r => [...r.xfer.inc.values()]).filter(i => i.state === 'done').map(i => i.blob.type); return t.length ? t : null; }), 12000);
     ok('hostile file is stored as an opaque download', !!types && types.every(x => x === 'application/octet-stream'), JSON.stringify(types));
     ok('hostile text shown as plain text', !!(await hasText(host, '<img src=x onerror=window.__pwn=1>')));
@@ -346,6 +346,88 @@ const tests = {
     ok('message written offline is delivered', !!(await hasText(guest, 'написано без связи')));
     ok('banner disappears', !!(await until(() => host.evaluate(() => document.querySelector('.netbar').hidden), 6000)));
   },
+  async group(browser) {
+    const host = await ctx(browser);
+    await host.goto(URL0);
+    await host.click('#act-chat'); await host.click('#who-group');
+    await host.fill('input[type=text]', 'Штаб');
+    await host.getByRole('button', { name: 'Создать' }).click();
+    await host.waitForSelector('#invite-url');
+    const link = await host.inputValue('#invite-url');
+    const gs = [];
+    for (let i = 0; i < 3; i++) { const g = await ctx(browser); await g.goto(link); gs.push(g); }
+    const upAll = list => until(async () => { for (const g of list) { const x = await st(g); if (!x || x.state !== 'up' || !x.online) return false; } return true; }, 25000);
+    ok('3 members joined the group by one QR', !!(await upAll(gs)));
+    ok('owner sees one group chat, member links hidden', await host.evaluate(() => __vz.visibleRooms.length === 1 && __vz.visibleRooms[0].members.all === 3));
+    ok('member sees the group name', !!(await until(() => gs[0].evaluate(() => document.querySelector('.bar .ttl').textContent.includes('Штаб')))));
+    await sendText(host, 'всем привет');
+    for (const g of gs) ok('member receives owner message', !!(await hasText(g, 'всем привет')));
+    ok('sender label shown', await gs[0].evaluate(() => [...document.querySelectorAll('.msg .from')].some(e => e.textContent === 'Админ')));
+    await gs[0].evaluate(() => { localStorage.setItem('vz.nick', '"Оля"'); [...__vz.rooms.values()][0].sendNick(); });
+    await gs[0].waitForTimeout(700);
+    await sendText(gs[0], 'я первый');
+    ok('owner sees member message', !!(await hasText(host, 'я первый')));
+    ok('other members see it with the name', !!(await hasText(gs[1], 'я первый')) && !!(await hasText(gs[2], 'я первый')) && await gs[1].evaluate(() => [...document.querySelectorAll('.msg .from')].some(e => e.textContent === 'Оля')));
+    await gs[0].waitForTimeout(800);
+    ok('sender does not get an echo', await gs[0].evaluate(() => [...document.querySelectorAll('.msg .txt')].filter(e => e.textContent === 'я первый').length === 1));
+    const f1 = rndFile('from-member.bin', 300 * 1024);
+    await gs[1].setInputFiles('input[type=file]', f1.file);
+    ok('member file reaches another member intact', (await hashOf(gs[2], 'from-member.bin')) === f1.hash);
+    ok('…and the owner', (await hashOf(host, 'from-member.bin')) === f1.hash);
+    const f2 = rndFile('from-owner.bin', 3 * 1024 * 1024);
+    await host.setInputFiles('input[type=file]', f2.file);
+    ok('3 MB file from the owner reaches members (direct link on demand)', (await hashOf(gs[0], 'from-owner.bin')) === f2.hash && (await hashOf(gs[2], 'from-owner.bin')) === f2.hash);
+    const late = await ctx(browser); await late.goto(link);
+    ok('late joiner gets the history', !!(await hasText(late, 'всем привет')) && !!(await hasText(late, 'я первый')));
+    await gs[2].reload();
+    ok('member returns after reload with history', !!(await upAll([gs[2]])) && !!(await hasText(gs[2], 'я первый')));
+    await host.reload();
+    ok('group survives owner restart', !!(await until(() => host.evaluate(() => { const h = __vz.visibleRooms[0]; return h && h.rec.hub && h.members.on === 4; }), 25000)));
+    await sendText(late, 'после перезапуска');
+    ok('messages flow after owner restart', !!(await hasText(host, 'после перезапуска')) && !!(await hasText(gs[1], 'после перезапуска')));
+    await host.screenshot({ path: path.join(OUT, 'group-host.png') });
+    await host.click('#menu-btn');
+    await host.getByRole('button', { name: /Удалить группу у всех/ }).click();
+    ok('deleting the group removes it for members', !!(await until(async () => !(await st(gs[1])) && !(await st(late)) && await host.evaluate(() => __vz.rooms.size === 0 || [...__vz.rooms.values()].every(r => r.rec.fav)), 10000)));
+  },
+  async fav(browser) {
+    const p = await ctx(browser);
+    await p.goto(URL0);
+    await p.click('#fav-row');
+    await sendText(p, 'заметка на память');
+    const f = rndFile('doc.pdf', 200000);
+    await p.setInputFiles('input[type=file]', f.file);
+    ok('note and file saved', !!(await hasText(p, 'заметка на память')));
+    await p.reload();
+    ok('favourites survive reload', !!(await hasText(p, 'заметка на память')) && !!(await until(() => p.evaluate(() => !!document.querySelector('.msg .fname')))));
+    await p.locator('.msg .txt', { hasText: 'заметка на память' }).click();
+    await p.getByRole('button', { name: /Хранить 24 часа/ }).click();
+    ok('per-item keep time set', await p.evaluate(() => { const m = __vz.rooms.get('fav').msgs.find(x => x.text); return m.del > Date.now() + 23 * 3600e3; }));
+    await p.evaluate(() => { __vz.rooms.get('fav').msgs.find(x => x.text).del = Date.now() - 1; });
+    ok('expired item disappears, the rest stays', !!(await until(() => p.evaluate(() => { const r = __vz.rooms.get('fav'); return r.msgs.length === 1 && !!r.msgs[0].file; }), 5000)));
+  },
+  async intro(browser) {
+    const host = await ctx(browser), a = await ctx(browser), b = await ctx(browser);
+    const l1 = await makeRoom(host); await a.goto(l1);
+    const l2 = await makeRoom(host); await b.goto(l2);
+    ok('two friends connected to the owner', !!(await until(() => host.evaluate(() => [...__vz.rooms.values()].filter(r => r.state === 'up' && r.online).length === 2))));
+    await host.goto(URL0); await host.click('#home-menu'); await host.getByRole('button', { name: /Соединения/ }).click();
+    const kp = await until(async () => { const x = (await host.textContent('.kpis')).replace(/\s/g, ''); return x.startsWith('2соединений2всети') ? x : null; }, 15000);
+    ok('connections panel counts', !!kp, String(kp));
+    await host.click('#intro-do');
+    const both = await until(async () => (await a.evaluate(() => __vz.rooms.size)) === 2 && (await b.evaluate(() => __vz.rooms.size)) === 2, 10000);
+    ok('both friends got a new chat', !!both);
+    const peerUp = p => until(() => p.evaluate(() => { const r = [...__vz.rooms.values()].find(x => x.rec.intro); return r && r.state === 'up' && r.online; }), 20000);
+    ok('friends are connected to each other', !!(await peerUp(a)) && !!(await peerUp(b)));
+    await a.evaluate(() => [...__vz.rooms.values()].find(x => x.rec.intro).sendText('привет напрямую'));
+    ok('friend-to-friend message arrives', !!(await until(() => b.evaluate(() => [...__vz.rooms.values()].find(x => x.rec.intro).msgs.some(m => m.text === 'привет напрямую')))));
+    ok('owner cannot see their conversation', await host.evaluate(() => ![...__vz.rooms.values()].some(r => r.msgs.some(m => m.text === 'привет напрямую'))));
+    ok('friends did not become admins of each other (no extra rooms on owner)', await host.evaluate(() => __vz.rooms.size === 2 || [...__vz.rooms.values()].filter(r => !r.local).length === 2));
+    await host.getByRole('button', { name: 'Разорвать' }).last().click();
+    ok('owner can end the introduction', !!(await until(async () => (await a.evaluate(() => __vz.rooms.size)) === 1 && (await b.evaluate(() => __vz.rooms.size)) === 1, 10000)));
+    await host.goto(URL0 + '#stat');
+    ok('statistics screen shows counters', !!(await until(() => host.evaluate(() => document.querySelectorAll('.srow').length > 8 && /[1-9]/.test(document.querySelector('.srow:nth-child(2)').textContent)))));
+  },
   async receipts(browser) {
     const { host, guest, up } = await pair(browser);
     ok('session', !!up);
@@ -355,7 +437,7 @@ const tests = {
     ok('delivered: one tick while unread', !!(await until(async () => { const x = await tickOf(); return x && x.includes('✓') && !x.includes('✓✓'); })));
     await guest.waitForTimeout(1200);
     ok('still one tick while the chat is closed', !(await tickOf()).includes('✓✓'));
-    await guest.click('.room >> nth=0');
+    await guest.click('.room:not(.fav) >> nth=0');
     ok('read: two ticks once the chat is opened', !!(await until(async () => (await tickOf()).includes('✓✓'), 8000)));
     await sendText(host, 'а это сразу');
     ok('read at once while the chat is on screen', !!(await until(async () => { const x = await tickOf(); return x.includes('✓✓') && (await host.evaluate(() => [...document.querySelectorAll('.msg.me')].pop().textContent.includes('а это сразу'))); }, 8000)));
@@ -526,6 +608,28 @@ const tests = {
       const guest = await ctx(browser);
       await guest.goto(link);
       ok('invite works on claimed site', !!(await until(async () => (await st(guest))?.state === 'up')));
+      // second admin device by QR (no passphrase typed on it)
+      const dev2 = await ctx(browser);
+      await dev2.goto(URL0 + '#own');
+      const aurl = await until(() => dev2.evaluate(() => document.querySelector('.qrbox')?.dataset.url));
+      ok('new device shows admin QR', !!aurl && aurl.includes('#a='));
+      await host.goto(aurl);
+      await host.click('#grant-yes');
+      ok('device became admin by QR', !!(await until(async () => await dev2.locator('#act-chat').count() === 1, 12000)));
+      const link2 = await makeRoom(dev2);
+      const g2 = await ctx(browser);
+      await g2.goto(link2);
+      ok('guest accepts a room hosted by the delegated admin', !!(await until(async () => (await st(g2))?.state === 'up', 15000)));
+      await dev2.goto(URL0); await dev2.reload();
+      ok('delegated admin remembered after reload', !!(await until(async () => await dev2.locator('#act-chat').count() === 1)));
+      // introductions on a claimed site: a friend hosts the room, the other friend must accept it
+      await host.goto(URL0 + '#adm');
+      console.log('   host rooms:', JSON.stringify(await until(async () => { const x = await host.evaluate(() => [...__vz.rooms.values()].map(r => [r.rec.name, r.state, r.online, !!r.rec.pair])); return x.filter(y => y[1] === 'up').length >= 2 ? x : null; }, 15000)), await host.evaluate(() => [location.hash, __vz.isAdmin]));
+      await host.waitForSelector('#intro-do');
+      await host.click('#intro-do');
+      const introUp = p => until(() => p.evaluate(() => { const r = [...__vz.rooms.values()].find(x => x.rec.intro); return r && r.state === 'up'; }), 20000);
+      ok('introduced friends connect on a claimed site', !!(await introUp(dev)) && !!(await introUp(guest)));
+      ok('friend still cannot create chats', await guest.evaluate(() => !__vz.isAdmin));
       // an impostor (does not have the owner key) creates a room: guests must refuse it
       const fake = await ctx(browser);
       await fake.route('**/owner.json', r => r.fulfill({ contentType: 'application/json', body: '{}' }));
