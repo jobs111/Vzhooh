@@ -2,10 +2,14 @@
 import { hkdf } from './crypto';
 import { b64, concat, td, te, U8, unb64 } from './util';
 
-export interface Invite { secure: boolean; reusable: boolean; secret: U8; exp: number; relays?: string[] }
+export interface Invite {
+  secure: boolean; reusable: boolean; secret: U8; exp: number; relays?: string[];
+  lobby?: boolean;   // multi-device invite: every device gets its own room
+  files?: boolean;   // lobby that shares files
+}
 
 export function encodeInvite(i: Invite): string {
-  const flags = (i.secure ? 1 : 0) | (i.reusable ? 2 : 0) | (i.relays?.length ? 4 : 0);
+  const flags = (i.secure ? 1 : 0) | (i.reusable ? 2 : 0) | (i.relays?.length ? 4 : 0) | (i.lobby ? 8 : 0) | (i.files ? 16 : 0);
   const e = i.exp >>> 0;
   return b64(concat([1, flags], i.secret, [e >>> 24, (e >>> 16) & 255, (e >>> 8) & 255, e & 255],
     i.relays?.length ? te.encode(i.relays.join('\n')) : []));
@@ -15,8 +19,10 @@ export function decodeInvite(s: string): Invite | null {
     const u = unb64(s);
     if (u.length < 22 || u[0] !== 1) return null;
     const exp = ((u[18] << 24) | (u[19] << 16) | (u[20] << 8) | u[21]) >>> 0;
-    const relays = u[1] & 4 ? td.decode(u.subarray(22)).split('\n').filter(x => /^wss:\/\/[^\s]+$/.test(x) || /^ws:\/\/(127\.0\.0\.1|localhost)[:/]/.test(x)).slice(0, 6) : undefined;
-    return { secure: !!(u[1] & 1), reusable: !!(u[1] & 2), secret: u.slice(2, 18), exp, relays };
+    const relays = u[1] & 4
+      ? td.decode(u.subarray(22)).split('\n').filter(x => /^wss:\/\/[^\s]+$/.test(x) || /^ws:\/\/(127\.0\.0\.1|localhost)[:/]/.test(x)).slice(0, 6)
+      : undefined;
+    return { secure: !!(u[1] & 1), reusable: !!(u[1] & 2), secret: u.slice(2, 18), exp, relays, lobby: !!(u[1] & 8), files: !!(u[1] & 16) };
   } catch { return null; }
 }
 export const baseUrl = () => location.origin + location.pathname;

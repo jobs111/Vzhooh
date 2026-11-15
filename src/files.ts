@@ -2,9 +2,10 @@
 // Direct link (WebRTC data channel): any size, with backpressure. Relay: small files only, windowed.
 import type { Room } from './room';
 import type { Msg } from './store';
-import { concat, now, sleep, U8 } from './util';
+import { t } from './i18n';
+import { concat, fmtSize, now, sleep, U8 } from './util';
 
-export const RELAY_MAX = 600 * 1024;        // biggest file allowed through public relays
+export const RELAY_MAX = 1024 * 1024;       // biggest file allowed through public relays (they are shared, free servers)
 export const AUTO_MAX = 24 * 1024 * 1024;   // auto-download limit on a direct link
 /** Types we are willing to render inline. Everything else (HTML, SVG, ...) is treated as an opaque download. */
 export const safeMime = (m: string) => /^(image\/(png|jpeg|gif|webp)|(audio|video)\/[\w.+-]+)$/.test(m) ? m : 'application/octet-stream';
@@ -38,10 +39,11 @@ export class Xfer {
     }
     return i;
   }
-  /** Auto-download small files; big ones wait for a tap. */
+  /** Files up to AUTO_MAX download by themselves (waiting for a direct link if they are too big for the relay);
+   *  bigger ones wait for a tap. */
   auto(m: Msg) {
     const i = this.ensure(m);
-    if (i.size <= (this.room.direct ? AUTO_MAX : RELAY_MAX) || i.size <= AUTO_MAX && /^(image|audio)\//.test(i.mime)) this.fetch(i.tid);
+    if (i.size <= AUTO_MAX) this.fetch(i.tid);
   }
   fetch(tid: number, sink?: Inc['sink']) {
     const i = this.inc.get(tid);
@@ -176,4 +178,19 @@ export class Xfer {
     }
     this.room.emit('file', tid);
   }
+}
+
+/** User asked to download a file: very big files go straight to disk where the browser allows it. */
+export async function startDownload(room: Room, m: Msg) {
+  const f = m.file!;
+  const picker = (window as any).showSaveFilePicker;
+  if (f.size > 200 * 1024 * 1024 && picker) {
+    try {
+      const handle = await picker({ suggestedName: f.name });
+      room.xfer.fetch(f.tid, await handle.createWritable());
+      return;
+    } catch (e: any) { if (e?.name === 'AbortError') return; }
+  }
+  if (f.size > 1024 * 1024 * 1024 && !confirm(t('bigAsk', fmtSize(f.size)))) return;
+  room.xfer.fetch(f.tid);
 }

@@ -38,4 +38,5 @@ setLang(lang);
   if (navigator.locks && !(await hold(false))) { otherTab(); return; }
   await start();
 })().catch(e => { console.error(e); root.textContent = 'Error: ' + e; });
-(window as any).__vz = app;
+// debugging/test handle: only when explicitly enabled on this device
+if (import.meta.env.DEV || localStorage.getItem('vz.debug') === 'true') (window as any).__vz = app;

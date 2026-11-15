@@ -3,6 +3,7 @@
 import { app } from './app';
 import { aesKey, ecdh, ecdhGen, hkdf, hmac, KeyPair, ownerSign, ownerVerify, sasEmoji, seal, unseal } from './crypto';
 import { Xfer } from './files';
+import { sendJoin } from './lobby';
 import { Rtc } from './rtc';
 import { db, FileMeta, Msg, RoomRec } from './store';
 import { b64, canZ, concat, deflate, Emitter, eq, inflate, now, rnd, td, te, U8, unb64 } from './util';
@@ -12,8 +13,8 @@ const PERSIST_MAX = 16 * 1024 * 1024;
 type Op = Record<string, any>;
 const J = (o: Op) => concat([0], te.encode(JSON.stringify(o)));
 
-export interface CallState { st: 'idle' | 'out' | 'in' | 'on'; video: boolean; at: number; t0: number; rau: boolean; rvi: boolean; mic: boolean; cam: boolean }
-const idleCall = (): CallState => ({ st: 'idle', video: false, at: 0, t0: 0, rau: true, rvi: false, mic: true, cam: false });
+export interface CallState { st: 'idle' | 'out' | 'in' | 'on'; video: boolean; at: number; t0: number; rau: boolean; rvi: boolean; mic: boolean; cam: boolean; scr: boolean }
+const idleCall = (): CallState => ({ st: 'idle', video: false, at: 0, t0: 0, rau: true, rvi: false, mic: true, cam: false, scr: false });
 
 export class Room extends Emitter {
   msgs: Msg[] = [];
@@ -60,6 +61,7 @@ export class Room extends Emitter {
   private rtcT: any;
   private riAt = 0;
   private nudgeT: any;
+  private idleAt = 0;
 
   constructor(public rec: RoomRec) {
     super();
@@ -213,6 +215,7 @@ export class Room extends Emitter {
     if (!hs || hs.done || this.state === 'off') return;
     const o: Op = { t: 'hi', v: PROTO, e: b64(hs.kp.pub), n: b64(hs.n), g: this.rec.g, z: canZ ? 1 : 0 };
     if (this.rec.rk) o.r = b64((await hmac(unb64(this.rec.rk), concat(hs.kp.pub, hs.n))).subarray(0, 16));
+    if (this.rec.lobby && this.rec.sub) await sendJoin(unb64(this.rec.lobby), unb64(this.rec.sub));
     await this.sendWire(0, J(o));
     const d = hs.tries < 8 ? 2500 : hs.tries < 30 ? 8000 : 30000;
     hs.tries++;
@@ -235,6 +238,7 @@ export class Room extends Emitter {
       else if (now() - this.hsAt > 3500) await this.hsStart();
       return;
     }
+    if (o.t === 'no' && o.L && this.rec.lobby && !this.kSess) { this.fail(String(o.c || 'no')); return; }
     if (!hs || o.n !== b64(hs.n) || hs.done) return;
     if (o.t === 'no') { this.fail(String(o.c || 'no')); return; }
     if (o.t !== 'wl') return;
@@ -286,7 +290,7 @@ export class Room extends Emitter {
   }
   private sendCfg() {
     const r = this.rec;
-    this.send({ t: 'cfg', md: r.mode, ex: r.exp, tm: r.timer, nm: r.name, ic: app.customIce() || undefined });
+    this.send({ t: 'cfg', md: r.mode, ex: r.exp, tm: r.timer, nm: r.name, ic: app.customIce() || undefined, cr: r.call });
   }
   private sessionUp() {
     this.state = 'up';
@@ -296,7 +300,9 @@ export class Room extends Emitter {
     this.setOnline(true);
     for (const m of this.msgs) if (m.mine && m.st === 0 && !m.sys) this.sendR(this.msgOp(m));
     if (this.rec.dead) this.sendR({ t: 'wipe' }, undefined, ok => { if (ok) app.removeRoom(this); });
+    if (this.host && this.rec.share && this.rec.lid) app.lobbies.get(this.rec.lid)?.serve(this);
     this.emit('state');
+    this.xfer.linkChanged();
   }
 
   // ---------- link: send / reliable ops / presence ----------
@@ -396,6 +402,12 @@ export class Room extends Emitter {
         this.callCleanup('noanswer');
       }
     }
+    if (this.host && this.rec.lid && !this.rec.share && !this.rec.bound && t - this.rec.created > 15 * 60e3) { this.stop(); app.removeRoom(this); return; }
+    if (this.host && this.rec.share) {
+      if (this.state === 'up' && this.online) this.idleAt = 0;
+      else if (!this.idleAt) this.idleAt = t;
+      else if (t - this.idleAt > 10 * 60e3) { this.stop(); app.removeRoom(this); return; }
+    }
     const dead = this.msgs.filter(m => m.del && m.del <= t);
     if (dead.length) {
       this.msgs = this.msgs.filter(m => !dead.includes(m));
@@ -425,7 +437,7 @@ export class Room extends Emitter {
       case 'go': if (this.host && !this.rtc) { this.rtcGen = 1; this.startRtc(); } break;
       case 'by':
         this.lastRx = 0; this.setOnline(false);
-        if (o.x && this.rec.mode === 's') this.closeLocal('peer');
+        if (o.x && (this.rec.mode === 's' || (this.rec.share && this.host))) this.closeLocal('peer');
         else if (o.x) this.rtc?.stale();
         break;
       case 'm': this.onMsg(o); break;
@@ -443,6 +455,7 @@ export class Room extends Emitter {
       case 'fg': void this.xfer.serve(o.f >>> 0, +o.o || 0, +o.l || 0); break;
       case 'fn': this.xfer.onNak(o.f >>> 0); break;
       case 'c': this.onCall(o); break;
+      case 'dm': if (typeof o.m === 'string') this.removeMsg(o.m, false); break;
     }
   }
   private onCfg(o: Op) {
@@ -455,7 +468,8 @@ export class Room extends Emitter {
     r.timer = Math.max(0, o.tm | 0);
     if (typeof o.nm === 'string' && o.nm) r.name = o.nm.slice(0, 60);
     this.cfgIce = Array.isArray(o.ic) ? o.ic : undefined;
-    if (r.tmp) { r.tmp = false; app.pairDone(this); }
+    if (o.cr === 'a' || o.cr === 'v') r.call = o.cr;
+    if (r.tmp && r.pair) { r.tmp = false; app.pairDone(this); }
     this.save();
     if (first) this.sendR({ t: 'go' });
     this.emit('state');
@@ -543,6 +557,28 @@ export class Room extends Emitter {
     this.addMsg(m);
     if (this.state === 'up') this.sendR(this.msgOp(m));
   }
+  /** Offer an existing blob under a known id (file-share rooms). */
+  offerFile(meta: FileMeta, blob: Blob) {
+    this.xfer.offer(meta.tid, blob);
+    const m: Msg = { id: b64(rnd(6)), mine: true, ts: now(), st: 0, file: { ...meta } };
+    this.addMsg(m);
+    if (this.state === 'up') this.sendR(this.msgOp(m));
+  }
+  /** Delete one message here; with forAll (own messages only) also on the peer's device. */
+  deleteMsg(id: string, forAll: boolean) {
+    const m = this.msgs.find(x => x.id === id);
+    if (!m) return;
+    this.removeMsg(id, true);
+    if (forAll && m.mine && !m.sys) this.sendR({ t: 'dm', m: id });
+  }
+  private removeMsg(id: string, own: boolean) {
+    const m = this.msgs.find(x => x.id === id && (own || !x.mine));
+    if (!m) return;
+    this.msgs = this.msgs.filter(x => x !== m);
+    void db.del('msgs', this.rec.id + '|' + m.id);
+    if (m.file) this.dropFile(m.file.tid);
+    this.emit('purge');
+  }
   private onMsg(o: Op) {
     const id = String(o.i);
     if (this.msgs.some(m => m.id === id)) return;
@@ -554,6 +590,8 @@ export class Room extends Emitter {
         tid: f.t >>> 0, dur: +f.d || undefined, voice: !!f.v };
     }
     if (!m.text && !m.file) return;
+    if (m.file && this.msgs.some(x => !x.mine && x.file?.tid === m.file!.tid)) return;   // the same file offered again
+    if (this.rec.share && m.text && this.msgs.some(x => !x.mine && x.text === m.text)) return;
     if (app.active !== this.rec.id || document.hidden) this.rec.unread++;
     this.addMsg(m);
     if (m.file) this.xfer.auto(m);
@@ -609,7 +647,7 @@ export class Room extends Emitter {
 
   // ---------- calls ----------
   private setCall(p: Partial<CallState>) { Object.assign(this.call, p); this.emit('call'); }
-  private sendMediaState() { this.sendR({ t: 'c', a: 'st', au: this.call.mic ? 1 : 0, vi: this.call.cam ? 1 : 0 }, 'cst'); }
+  private sendMediaState() { this.sendR({ t: 'c', a: 'st', au: this.call.mic ? 1 : 0, vi: this.call.cam || this.call.scr ? 1 : 0 }, 'cst'); }
   async callStart(video: boolean) {
     if (this.call.st !== 'idle') return;
     if (!this.direct || !this.rtc) throw new Error('nop2p');
@@ -670,4 +708,17 @@ export class Room extends Emitter {
     this.sendMediaState();
   }
   async switchCam() { if (this.rtc && this.call.cam) { await this.rtc.switchCam(); this.emit('call'); } }
+  /** Show my screen instead of the camera (desktop browsers). Stopping returns to the camera if it was on. */
+  async toggleScreen() {
+    const rtc = this.rtc;
+    if (!rtc || this.call.st !== 'on') return;
+    if (this.call.scr) {
+      this.setCall({ scr: false });
+      await rtc.stopScreen(this.call.cam);
+    } else {
+      await rtc.startScreen(() => { if (this.call.scr) void this.toggleScreen(); });
+      this.setCall({ scr: true });
+    }
+    this.sendMediaState();
+  }
 }

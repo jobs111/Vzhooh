@@ -8,19 +8,32 @@ export interface RoomRec {
   g?: string; rk?: string;             // guest: own slot id + resume key
   timer: number; unread: number; last: number;
   dead?: boolean; paused?: boolean; tmp?: boolean; pair?: boolean; relays?: string[];
+  lobby?: string; sub?: string;        // guest: joined through a multi-device invite (lobby secret + own sub-id)
+  lid?: string;                        // host: the lobby this room was opened from
+  share?: boolean;                     // file-share room (temporary, both sides)
+  call?: 'a' | 'v';                    // call room: the call starts by itself once the peer is here
+  called?: boolean;                    // call room: the automatic call has already been made
+}
+/** Multi-device invite: one link/QR, every device that opens it gets its own private room.
+ *  kind 'chat' → a normal chat per device; kind 'files' → the devices download the shared files. */
+export interface LobbyRec {
+  id: string; secret: string; kind: 'chat' | 'files'; name: string; mode: 'f' | 's';
+  created: number; exp: number; invExp: number; life: number; n: number;
+  files: (FileMeta & { mem?: boolean })[]; note?: string; dl: number; closed?: boolean;
 }
 
 let dbp: Promise<IDBDatabase | null> | null = null;
 function open(): Promise<IDBDatabase | null> {
   return dbp ||= new Promise(res => {
     try {
-      const rq = indexedDB.open('vzhooh', 1);
+      const rq = indexedDB.open('vzhooh', 2);
       rq.onupgradeneeded = () => {
-        const d = rq.result;
-        d.createObjectStore('rooms', { keyPath: 'id' });
-        d.createObjectStore('msgs', { keyPath: 'k' }).createIndex('room', 'room');
-        d.createObjectStore('blobs', { keyPath: 'k' }).createIndex('room', 'room');
-        d.createObjectStore('kv');
+        const d = rq.result, has = (n: string) => d.objectStoreNames.contains(n);
+        if (!has('rooms')) d.createObjectStore('rooms', { keyPath: 'id' });
+        if (!has('msgs')) d.createObjectStore('msgs', { keyPath: 'k' }).createIndex('room', 'room');
+        if (!has('blobs')) d.createObjectStore('blobs', { keyPath: 'k' }).createIndex('room', 'room');
+        if (!has('kv')) d.createObjectStore('kv');
+        if (!has('lobbies')) d.createObjectStore('lobbies', { keyPath: 'id' });
       };
       rq.onsuccess = () => res(rq.result);
       rq.onerror = rq.onblocked = () => res(null);

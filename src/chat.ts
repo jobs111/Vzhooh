@@ -1,19 +1,15 @@
 // Chat screen: messages, files, voice messages, call overlay, room menu.
 import { app } from './app';
-import { RELAY_MAX, safeMime } from './files';
+import { RELAY_MAX, safeMime, startDownload } from './files';
 import { t } from './i18n';
 import { inviteUrl } from './invite';
-import { qrCanvas } from './qr';
 import type { Room } from './room';
 import { ring } from './sound';
 import type { Msg } from './store';
-import { copyText, go, mount, roomStatus, roomTitle, toast } from './ui';
-import { fmtClock, fmtDur, fmtSize, h, now } from './util';
+import { inviteBlock, shareGuestView } from './tools';
+import { copyText, go, mount, netBar, roomStatus, roomTitle, toast } from './ui';
+import { fmtClock, fmtDur, fmtSize, h, linkify, now } from './util';
 
-const URL_RE = /(https?:\/\/[^\s<>"']+)/g;
-function linkify(text: string): (Node | string)[] {
-  return text.split(URL_RE).map((p, i) => i % 2 ? h('a', { href: p, target: '_blank', rel: 'noopener noreferrer' }, p) : p);
-}
 function timerLabel(s: number) {
   return s === 0 ? t('off') : s === 30 ? t('s30') : s === 300 ? t('m5') : s === 600 ? t('m10') : s === 3600 ? t('h1') : s + ' s';
 }
@@ -27,13 +23,15 @@ async function shrinkImage(f: Blob, max: number, q: number): Promise<Blob | null
     return await new Promise(res => c.toBlob(res, 'image/jpeg', q));
   } catch { return null; }
 }
+const canScreen = () => !!(navigator.mediaDevices as any)?.getDisplayMedia;
 
 export function chatView(room: Room) {
+  if (room.rec.share && !room.host) { shareGuestView(room); return; }
   app.active = room.rec.id;
   room.markRead();
   const off: (() => void)[] = [];
   const els = new Map<string, HTMLElement>();
-  const list = h('div.msgs');
+  const list = h('div.msgs', { id: 'msgs' });
   const dot = h('span.dot'), sub = h('div.sub');
   const banner = h('div.banner');
   const menu = h('div.menu', { hidden: true });
@@ -89,16 +87,18 @@ export function chatView(room: Room) {
     } else {
       const need = f.size > RELAY_MAX && !room.direct;
       if (i.want) box.append(h('div.prog', need ? t('waitDirect') : '…'));
-      else box.append(h('button.btn', { onclick: () => void download(m) }, '⬇ ' + t('download') + ' · ' + fmtSize(f.size)), need ? h('div.prog', t('needDirect')) : '');
+      else box.append(h('button.btn', { onclick: () => void startDownload(room, m) }, '⬇ ' + t('download') + ' · ' + fmtSize(f.size)), need ? h('div.prog', t('needDirect')) : '');
     }
     return box;
   };
   const render = (m: Msg): HTMLElement => {
     if (m.sys) return h('div.sys', sysText(m));
-    return h('div.msg' + (m.mine ? '.me' : ''),
+    const el = h('div.msg' + (m.mine ? '.me' : ''),
       m.text ? h('div.txt', linkify(m.text)) : null,
       m.file ? fileEl(m) : null,
       h('div.meta', m.del ? '⏱ ' : '', fmtClock(m.ts), m.mine ? (m.st ? ' ✓' : ' 🕓') : ''));
+    el.dataset.id = m.id;
+    return el;
   };
   const put = (m: Msg, scroll = false) => {
     const stick = scroll || nearBottom();
@@ -131,40 +131,48 @@ export function chatView(room: Room) {
       if (barI) barI.style.width = pct + '%';
     }
   };
-  async function download(m: Msg) {
-    const f = m.file!;
-    const picker = (window as any).showSaveFilePicker;
-    if (f.size > 200 * 1024 * 1024 && picker) {
-      try {
-        const handle = await picker({ suggestedName: f.name });
-        room.xfer.fetch(f.tid, await handle.createWritable());
-        return;
-      } catch (e: any) { if (e?.name === 'AbortError') return; }
-    }
-    if (f.size > 1024 * 1024 * 1024 && !confirm(t('bigAsk', fmtSize(f.size)))) return;
-    room.xfer.fetch(f.tid);
-  }
+
+  // ----- tap on a message: copy / delete -----
+  const closeAct = () => document.querySelectorAll('.mact').forEach(e => e.remove());
+  list.addEventListener('click', e => {
+    menu.hidden = true;
+    const tgt = e.target as HTMLElement;
+    if (tgt.closest('a, button, audio, video, img, input, select, textarea')) return;
+    const el = tgt.closest<HTMLElement>('.msg');
+    closeAct();
+    if (!el || getSelection()?.toString()) return;
+    const m = room.msgs.find(x => x.id === el.dataset.id);
+    if (!m) return;
+    const act = (label: string, fn: () => void, cls = '') => h('button' + cls, { onclick: (ev: Event) => { ev.stopPropagation(); closeAct(); fn(); } }, label);
+    const pop = h('div.mact', { role: 'menu' },
+      m.text ? act('📋 ' + t('mCopy'), () => void copyText(m.text!)) : null,
+      m.mine ? act('🗑 ' + t('mDelAll'), () => room.deleteMsg(m.id, true), '.danger') : null,
+      act('✕ ' + t('mDelMe'), () => room.deleteMsg(m.id, false)));
+    document.body.append(pop);
+    const r = el.getBoundingClientRect(), pw = pop.offsetWidth, ph = pop.offsetHeight;
+    pop.style.left = Math.max(8, Math.min(innerWidth - pw - 8, m.mine ? r.right - pw : r.left)) + 'px';
+    pop.style.top = Math.max(8, Math.min(innerHeight - ph - 8, r.bottom + 4)) + 'px';
+  });
+  list.addEventListener('scroll', closeAct, { passive: true });
+  off.push(closeAct);
 
   // ----- header / state -----
   const callA = h('button.ic', { title: t('audioCall'), onclick: () => void startCall(false) }, '📞') as HTMLButtonElement;
   const callV = h('button.ic', { title: t('videoCall'), onclick: () => void startCall(true) }, '🎥') as HTMLButtonElement;
   const drawInvite = () => {
     const r = room.rec;
-    const can = room.host && !r.pair && (!r.bound || r.reusable) && (!r.invExp || now() < r.invExp);
+    const can = room.host && !r.pair && !r.lid && (!r.bound || r.reusable) && (!r.invExp || now() < r.invExp);
     const want = can && (showInvite || (!r.bound && room.state !== 'up'));
     if (!want) { panel.hidden = true; panel.replaceChildren(); return; }
     if (!panel.hidden && panel.childElementCount) return;
     const url = inviteUrl('j', app.invite(room));
     panel.hidden = false;
-    panel.replaceChildren(
-      h('h2', t('inviteTitle')),
+    panel.replaceChildren(...[
+      h('h2', r.call ? t('callTitle') : t('inviteTitle')),
+      r.call ? h('p.note', t('callWait')) : null,
       h('p.hint', t(r.reusable ? 'inviteHintN' : 'inviteHint1') + (r.invExp ? ' ' + t('inviteUntil', new Date(r.invExp).toLocaleString()) : '')),
-      h('div.qrbox', qrCanvas(url)),
-      h('input.mono', { readOnly: true, value: url, id: 'invite-url', onclick: (e: Event) => (e.target as HTMLInputElement).select() }),
-      h('div.row',
-        h('button.primary', { onclick: () => copyText(url) }, t('copy')),
-        navigator.share ? h('button', { onclick: () => void navigator.share({ url }).catch(() => {}) }, t('share')) : null,
-        r.bound ? h('button', { onclick: () => { showInvite = false; drawInvite(); } }, t('close')) : null));
+      inviteBlock(url, 'invite-url', roomTitle(room)),
+      r.bound ? h('button', { onclick: () => { showInvite = false; drawInvite(); } }, t('close')) : null].filter(Boolean) as Node[]);
   };
   const drawState = () => {
     const st = roomStatus(room);
@@ -172,22 +180,34 @@ export function chatView(room: Room) {
     sub.textContent = st.text + (room.rec.mode === 's' ? ' · 🔒' : '') + (room.rec.exp ? ' · ' + t('until', new Date(room.rec.exp).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })) : '');
     callA.disabled = callV.disabled = room.state !== 'up';
     banner.replaceChildren();
-    if (room.reject) banner.append(h('p.err', t('rj_' + (['used', 'exp', 'rev', 'ver', 'sig'].includes(room.reject) ? room.reject : 'no'))));
+    if (room.reject) banner.append(h('p.err', t('rj_' + (['used', 'exp', 'rev', 'ver', 'sig', 'full'].includes(room.reject) ? room.reject : 'no'))));
     else if (room.state === 'off') banner.append(h('button.primary', { onclick: () => room.start() }, t('connect')));
     else if (room.host && app.owner && !app.ownerKey) banner.append(h('p.err', t('needOwner')), h('button', { onclick: () => go('own') }, t('ownerLogin')));
     else if (room.host && !room.rec.bound && room.rec.invExp && now() > room.rec.invExp) {
       banner.append(h('p.err', t('inviteExpired')), h('button', { onclick: () => { room.rec.invExp = now() + 3600e3; room.save(); drawState(); } }, t('extend')));
-    }
+    } else if (!room.host && room.rec.call && room.state === 'up' && room.call.st === 'idle' && !room.rec.called) banner.append(h('p.hint', t('callGuestWait')));
     banner.hidden = !banner.childElementCount;
     drawInvite();
+    autoCall();
   };
+
+  // ----- call room: the owner's side calls by itself as soon as the peer is here -----
+  let upAt = 0, warned = false;
+  function autoCall() {
+    const r = room.rec;
+    if (!r.call || room.state !== 'up' || !room.online) { upAt = 0; return; }
+    if (!room.host || r.called || room.call.st !== 'idle') return;
+    upAt ||= now();
+    if (room.direct) { r.called = true; room.save(); void startCall(r.call === 'v'); }
+    else if (!warned && now() - upAt > 9000) { warned = true; room.retryDirect(); toast(t('callNoP2P'), 8000); }
+  }
 
   // ----- menu -----
   const item = (label: string, fn: () => void, cls = '') => h('button' + cls, { onclick: () => { menu.hidden = true; fn(); } }, label);
   const drawMenu = () => {
     const r = room.rec;
     menu.replaceChildren(...([
-      room.host && !r.pair && (!r.bound || r.reusable) ? item('🔗 ' + t('showInvite'), () => { showInvite = true; panel.replaceChildren(); drawInvite(); }) : null,
+      room.host && !r.pair && !r.lid && (!r.bound || r.reusable) ? item('🔗 ' + t('showInvite'), () => { showInvite = true; panel.replaceChildren(); drawInvite(); }) : null,
       room.sas ? item('🛡 ' + t('sasTitle'), () => alert(t('sasTitle') + ':\n\n' + room.sas + '\n\n' + t('sasHint'))) : null,
       r.mode === 's' ? h('label.mi', '⏱ ' + t('timer') + ' ', (() => {
         const s = h('select', [0, 30, 300, 600, 3600].map(v => h('option', { value: String(v), selected: v === r.timer }, timerLabel(v)))) as HTMLSelectElement;
@@ -275,7 +295,11 @@ export function chatView(room: Room) {
     catch (e: any) { const nop = e?.message === 'nop2p'; if (nop) room.retryDirect(); toast(t(nop ? 'callNoP2P' : 'mediaErr'), 8000); }
   }
   const accept = async (video: boolean) => { try { await room.callAccept(video); } catch { toast(t('mediaErr'), 8000); } };
-  const cb = (label: string, fn: () => void, cls = '', id = '') => h('button.cb' + cls, { onclick: fn, id: id || undefined }, label);
+  const screen = async () => {
+    try { await room.toggleScreen(); }
+    catch (e: any) { if (e?.name !== 'NotAllowedError' && e?.name !== 'AbortError') toast(t('noScreen'), 6000); }
+  };
+  const cb = (label: string, fn: () => void, cls = '', id = '', title = '') => h('button.cb' + cls, { onclick: fn, id: id || undefined, title: title || undefined }, label);
   const drawCall = () => {
     const c = room.call, rtc = room.rtc;
     clearInterval(callTick);
@@ -283,19 +307,21 @@ export function chatView(room: Room) {
     if (c.st === 'idle') {
       callBox.hidden = true; remoteV.srcObject = null; localV.srcObject = null;
       try { wake?.release(); } catch { /* ignore */ } wake = null;
+      drawState();
       return;
     }
     callBox.hidden = false;
     const title = roomTitle(room);
     if (c.st === 'in') {
       callInfo.replaceChildren(h('div.cname', title), h('div', t(c.video ? 'incomingV' : 'incoming')));
-      callBtns.replaceChildren(cb('📞 ' + t('accept'), () => void accept(false), '.ok', 'call-accept'),
-        c.video ? cb('🎥 ' + t('acceptV'), () => void accept(true), '.ok', 'call-accept-video') : null as any,
-        cb('✕ ' + t('decline'), () => room.callDecline(), '.bad'));
+      callBtns.replaceChildren(...[cb('📞 ' + t('accept'), () => void accept(false), '.ok', 'call-accept'),
+        c.video ? cb('🎥 ' + t('acceptV'), () => void accept(true), '.ok', 'call-accept-video') : null,
+        cb('✕ ' + t('decline'), () => room.callDecline(), '.bad')].filter(Boolean) as Node[]);
       return;
     }
     if (rtc?.local && localV.srcObject !== rtc.local) localV.srcObject = rtc.local;
-    localV.hidden = !c.cam;
+    localV.hidden = !(c.cam || c.scr);
+    localV.classList.toggle('scr', c.scr);
     if (c.st === 'out') {
       callInfo.replaceChildren(h('div.cname', title), h('div', t('calling')));
       callBtns.replaceChildren(cb('✕ ' + t('hangup'), () => room.callEnd(), '.bad', 'call-end'));
@@ -307,11 +333,12 @@ export function chatView(room: Room) {
     const upd = () => { time.textContent = fmtDur((now() - c.t0) / 1000) + (rtc && rtc.pc.connectionState !== 'connected' ? ' · ' + t('reconnecting') : '') + (c.rau ? '' : ' · 🔇'); };
     upd(); callTick = setInterval(upd, 1000);
     callInfo.replaceChildren(h('div.cname', title), time);
-    callBtns.replaceChildren(
-      cb(c.mic ? '🎙' : '🔇', () => room.toggleMic(), c.mic ? '' : '.offb', 'call-mic'),
-      cb(c.cam ? '📷' : '🚫📷', () => void room.toggleCam().catch(() => toast(t('mediaErr'))), c.cam ? '' : '.offb', 'call-cam'),
-      c.cam ? cb('🔄', () => void room.switchCam().catch(() => {})) : null as any,
-      cb('✕ ' + t('hangup'), () => room.callEnd(), '.bad', 'call-end'));
+    callBtns.replaceChildren(...[
+      cb(c.mic ? '🎙' : '🔇', () => room.toggleMic(), c.mic ? '' : '.offb', 'call-mic', t('voice')),
+      c.scr ? null : cb(c.cam ? '📷' : '🚫📷', () => void room.toggleCam().catch(() => toast(t('mediaErr'))), c.cam ? '' : '.offb', 'call-cam', t('videoCall')),
+      c.cam && !c.scr ? cb('🔄', () => void room.switchCam().catch(() => {})) : null,
+      canScreen() ? cb('🖥', () => void screen(), c.scr ? '.onb' : '', 'call-screen', t('screen')) : null,
+      cb('✕ ' + t('hangup'), () => room.callEnd(), '.bad', 'call-end')].filter(Boolean) as Node[]);
     if (!wake && (navigator as any).wakeLock) (navigator as any).wakeLock.request('screen').then((w: any) => { wake = w; }).catch(() => {});
   };
   off.push(() => { ring(null); clearInterval(callTick); try { wake?.release(); } catch { /* ignore */ } });
@@ -328,7 +355,7 @@ export function chatView(room: Room) {
     app.on('net', drawState));
   const vis = () => { if (!document.hidden) room.markRead(); };
   document.addEventListener('visibilitychange', vis);
-  const tick = setInterval(drawState, 5000);
+  const tick = setInterval(drawState, 2000);
   off.push(() => { document.removeEventListener('visibilitychange', vis); clearInterval(tick); if (app.active === room.rec.id) app.active = ''; });
 
   mount(h('div.page.chat',
@@ -337,10 +364,9 @@ export function chatView(room: Room) {
       h('div.grow', h('div.ttl', dot, ' ', roomTitle(room)), sub),
       callA, callV,
       h('button.ic', { id: 'menu-btn', onclick: () => { drawMenu(); menu.hidden = !menu.hidden; } }, '⋮')),
-    menu, banner, panel, list, recBar,
+    menu, netBar(off), banner, panel, list, recBar,
     h('footer.composer', fileIn, h('button.ic', { title: t('attach'), onclick: () => fileIn.click() }, '📎'), input, micBtn, sendBtn),
     callBox), off);
-  list.onclick = () => { menu.hidden = true; };
   redraw(); drawState(); drawCall(); grow();
   if (!coarse) input.focus();
 }

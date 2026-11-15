@@ -100,3 +100,9 @@ async function pipe(u: U8, s: CompressionStream | DecompressionStream): Promise<
 }
 export const deflate = (u: U8) => pipe(u, new CompressionStream('deflate-raw'));
 export const inflate = (u: U8) => pipe(u, new DecompressionStream('deflate-raw'));
+
+const URL_RE = /(https?:\/\/[^\s<>"']+)/g;
+/** Text with clickable links (links open in a new tab, without referrer). */
+export function linkify(text: string): (Node | string)[] {
+  return text.split(URL_RE).map((p, i) => i % 2 ? h('a', { href: p, target: '_blank', rel: 'noopener noreferrer' }, p) : p);
+}

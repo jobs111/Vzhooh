@@ -9,7 +9,8 @@ import { qrCanvas } from './qr';
 import type { Room } from './room';
 import { beep, unlockAudio } from './sound';
 import { conf } from './store';
-import { fmtClock, h, now } from './util';
+import { callRoomView, lobbyView, qrToolView, shareCreateView } from './tools';
+import { fmtClock, fmtSize, h, now } from './util';
 import { DEFAULT_BROKERS } from './wire';
 
 const root = document.getElementById('app')!;
@@ -17,6 +18,7 @@ let cleanup: (() => void)[] = [];
 export function mount(el: HTMLElement, off: (() => void)[] = []) {
   for (const f of cleanup) { try { f(); } catch (e) { console.warn(e); } }
   cleanup = off;
+  document.querySelectorAll('.qrfull, .lightbox, .mact').forEach(e => e.remove());
   root.replaceChildren(el);
 }
 let toastEl: HTMLElement | null = null;
@@ -33,18 +35,39 @@ export function go(hash: string, replace = false) {
 export async function copyText(s: string) {
   try { await navigator.clipboard.writeText(s); toast(t('copied')); } catch { window.prompt(t('copy'), s); }
 }
-const HOUR = 3600e3;
-const sel = (opts: [string | number, string][], val: string | number) =>
+export const HOUR = 3600e3;
+export const sel = (opts: [string | number, string][], val: string | number) =>
   h('select', opts.map(([v, label]) => h('option', { value: String(v), selected: String(v) === String(val) }, label))) as HTMLSelectElement;
-const field = (label: string, ...c: (Node | string)[]) => h('label.field', h('span', label), ...c);
-const bar = (title: string, back = '') => h('header.bar', h('button.ic', { onclick: () => go(back), 'aria-label': t('back') }, '←'), h('div.ttl', title));
+export const field = (label: string, ...c: (Node | string)[]) => h('label.field', h('span', label), ...c);
+export const bar = (title: string, back = '') => h('header.bar', h('button.ic', { onclick: () => go(back), 'aria-label': t('back') }, '←'), h('div.ttl', title));
+export const dateShort = (ts: number) => new Date(ts).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+
+/** Banner shown while the relay connections are down; reconnection itself is automatic. */
+export function netBar(off: (() => void)[]): HTMLElement {
+  const el = h('div.netbar', { hidden: true, role: 'status' });
+  let shown = false;
+  const upd = () => {
+    const down = app.wire.down;
+    el.hidden = !down;
+    if (down && !shown) {
+      el.replaceChildren(h('span.dot.wait'), h('span.grow', t(navigator.onLine ? 'netDown' : 'netOffline')),
+        h('button', { onclick: () => { app.kick(); toast(t('reconnectNow') + '…', 1500); } }, t('reconnectNow')));
+    }
+    shown = down;
+  };
+  const iv = setInterval(upd, 1000);
+  off.push(app.on('net', upd), () => clearInterval(iv));
+  upd();
+  return el;
+}
 
 export function roomTitle(r: Room) { return r.rec.name || (r.rec.pair ? t('device') : t('chatN')); }
 export function roomStatus(r: Room): { text: string; cls: string } {
   if (r.reject) return { text: t('stOffline'), cls: 'off' };
   if (r.state === 'off') return { text: t('stPaused'), cls: 'off' };
+  if (app.wire.down) return { text: t('stReconnect'), cls: 'wait' };
   if (r.state === 'wait') {
-    if (!app.wire.upCount) return { text: t('stNoNet'), cls: 'wait' };
+    if (!app.wire.upCount) return { text: t('stConnecting'), cls: 'wait' };
     const fresh = r.host ? !r.rec.bound : !r.rec.rk;
     return { text: fresh ? t('stWaiting') : t('stOffline'), cls: fresh ? 'wait' : 'off' };
   }
@@ -59,8 +82,18 @@ export async function route() {
   if (k !== 'r') app.active = '';
   if (k === 'j' && v) { history.replaceState(null, '', location.pathname + location.search); await joinBy(v); return; }
   if (k === 'p' && v) { history.replaceState(null, '', location.pathname + location.search); pairClaimView(v); return; }
-  if (k === 'r') { const r = app.rooms.get(v); if (r && !r.rec.dead) { chatView(r); return; } go('', true); return; }
+  if (k === 'r') {
+    const r = app.rooms.get(v);
+    if (r && !r.rec.dead) { chatView(r); return; }
+    const sh = sessionStorage.getItem('vz.sh.' + v);   // a file-download page was reloaded: join the share again
+    if (sh) { sessionStorage.removeItem('vz.sh.' + v); await joinBy(sh); return; }
+    go('', true); return;
+  }
+  if (k === 'l') { const l = app.lobbies.get(v); if (l) { lobbyView(l); return; } go('', true); return; }
   if (k === 'new') { newChatView(); return; }
+  if (k === 'share') { shareCreateView(); return; }
+  if (k === 'call') { callRoomView(); return; }
+  if (k === 'qr') { qrToolView(); return; }
   if (k === 'set') { settingsView(); return; }
   if (k === 'diag') { diagView(); return; }
   if (k === 'own') { ownerView(); return; }
@@ -73,7 +106,8 @@ async function joinBy(payload: string) {
   if (!inv) { sessionStorage.removeItem('vz.inv'); toast(t('badInvite')); homeView(); return; }
   if (inv.exp && now() > inv.exp * 1000) { sessionStorage.removeItem('vz.inv'); toast(t('inviteExpired')); homeView(); return; }
   sessionStorage.setItem('vz.inv', payload);
-  const r = await app.join(inv);
+  const r = inv.lobby ? await app.joinLobby(inv) : await app.join(inv);
+  if (inv.files) sessionStorage.setItem('vz.sh.' + r.rec.id, payload);
   const done = () => { if (r.state === 'up' || r.reject) { sessionStorage.removeItem('vz.inv'); off(); } };
   const off = r.on('state', done);
   done();
@@ -84,6 +118,8 @@ async function joinBy(payload: string) {
 function homeView() {
   const off: (() => void)[] = [];
   const list = h('div.rooms');
+  const lobbies = h('div.rooms');
+  const lobbyHead = h('h2', t('lobbies'));
   const net = h('span.dot');
   const pair = h('div');
   const draw = () => {
@@ -93,16 +129,29 @@ function homeView() {
       const st = roomStatus(r), last = [...r.msgs].reverse().find(x => !x.sys);
       return h('button.room', { onclick: () => go('r=' + r.rec.id) },
         h('span.dot.' + st.cls),
-        h('div.grow', h('div.name', (r.rec.mode === 's' ? '🔒 ' : '') + roomTitle(r)),
+        h('div.grow', h('div.name', (r.rec.mode === 's' ? '🔒 ' : '') + (r.rec.call ? '📞 ' : '') + roomTitle(r)),
           h('div.sub', last ? (last.text || (last.file?.voice ? '🎤' : '📎 ' + (last.file?.name || ''))).slice(0, 60) : st.text)),
         r.rec.unread ? h('span.badge', String(r.rec.unread)) : null,
         last ? h('span.time', fmtClock(last.ts)) : null);
     }) : [h('div.empty', t('noChats'))]));
+    const ls = app.isAdmin ? app.lobbyList : [];
+    lobbyHead.hidden = !ls.length;
+    lobbies.replaceChildren(...ls.map(l => {
+      const r = l.rec, kids = l.children();
+      const info = r.kind === 'files'
+        ? `${r.files.length} · ${fmtSize(r.files.reduce((a, f) => a + f.size, 0))} · ${t('downloads', r.dl)}`
+        : `${t('devices')}: ${kids.length}`;
+      return h('button.room', { onclick: () => go('l=' + r.id) },
+        h('span.lic', r.kind === 'files' ? '📁' : '👥'),
+        h('div.grow', h('div.name', r.name || t(r.kind === 'files' ? 'lobbyFiles' : 'lobbyChat')),
+          h('div.sub', info + (l.open ? (r.invExp ? ' · ' + t('until', dateShort(r.invExp)) : '') : ' · ' + t('lobbyClosed')))),
+        kids.some(k => k.online) ? h('span.dot.on') : null);
+    }));
   };
-  off.push(app.on('rooms', draw), app.on('net', draw));
+  off.push(app.on('rooms', draw), app.on('net', draw), app.on('lobbies', draw));
   const tick = setInterval(draw, 2000);
   off.push(() => clearInterval(tick));
-  // pairing QR for devices that are not the owner
+  // a device that is not the owner shows a pairing QR
   if (!app.isAdmin) {
     const qr = h('div.qrbox');
     const start = async () => {
@@ -116,12 +165,17 @@ function homeView() {
     off.push(() => { clearInterval(refresh); app.pairStop(); }, app.on('paired', (r: Room) => go('r=' + r.rec.id)));
     pair.append(h('section.card', h('h2', t('pairTitle')), h('p.hint', t('pairHint')), qr, h('p.hint.c', t('pairWait'))));
   }
+  const act = (icon: string, label: string, hash: string, id: string) => h('button.act', { onclick: () => go(hash), id }, h('span.aic', icon), h('span', label));
   mount(h('div.page',
     h('header.bar', h('div.ttl.big', t('app'), ' ', net), h('button.ic', { onclick: () => go('diag'), title: t('diag') }, '🩺'),
       h('button.ic', { onclick: () => go('set'), title: t('settings') }, '⚙')),
     h('main.body',
+      netBar(off),
       !app.owner ? h('p.note', t('unclaimed')) : null,
-      app.isAdmin ? h('button.primary.wide', { onclick: () => go('new') }, '+ ' + t('newChat')) : null,
+      app.isAdmin ? h('div.acts',
+        act('💬', t('newChat'), 'new', 'act-chat'), act('📞', t('actCall'), 'call', 'act-call'),
+        act('📁', t('actShare'), 'share', 'act-share'), act('▦', t('actQr'), 'qr', 'act-qr')) : null,
+      lobbyHead, lobbies,
       h('h2', t('chats')), list, pair,
       app.owner && !app.ownerKey ? h('button.link', { onclick: () => go('own') }, t('ownerLogin')) : null,
       h('p.foot', t('tagline') + ' · v' + VERSION))), off);
@@ -131,30 +185,35 @@ function homeView() {
 // ---------- new chat ----------
 function newChatView() {
   if (!app.isAdmin) { go('own', true); return; }
-  let secure = false;
+  let secure = false, many = false;
   const name = h('input', { type: 'text', maxLength: 40, placeholder: t('chatN') }) as HTMLInputElement;
   const life = sel([[HOUR, t('h1')], [24 * HOUR, t('h24')], [48 * HOUR, t('h48')]], 48 * HOUR);
   const inv = sel([[10 * 60e3, t('m10')], [HOUR, t('h1')], [24 * HOUR, t('h24')], [7 * 24 * HOUR, t('d7')], [0, t('forever')]], HOUR);
-  const reuse = h('input', { type: 'checkbox' }) as HTMLInputElement;
-  const hint = h('p.hint');
+  const modeHint = h('p.hint'), whoHint = h('p.hint');
   const lifeF = field(t('life'), life);
-  const bF = h('button.seg', { onclick: () => pick(false) }, '⚡ ' + t('fast'));
-  const bS = h('button.seg', { onclick: () => pick(true) }, '🔒 ' + t('secure'));
-  const pick = (s: boolean) => {
-    secure = s;
-    bF.classList.toggle('sel', !s); bS.classList.toggle('sel', s);
-    hint.textContent = t(s ? 'secureHint' : 'fastHint');
-    lifeF.hidden = s;
+  const bF = h('button.seg', { onclick: () => { secure = false; upd(); } }, '⚡ ' + t('fast'));
+  const bS = h('button.seg', { onclick: () => { secure = true; upd(); } }, '🔒 ' + t('secure'));
+  const b1 = h('button.seg', { onclick: () => { many = false; upd(); } }, '👤 ' + t('whoOne'));
+  const bN = h('button.seg', { onclick: () => { many = true; upd(); }, id: 'who-many' }, '👥 ' + t('whoMany'));
+  const upd = () => {
+    bF.classList.toggle('sel', !secure); bS.classList.toggle('sel', secure);
+    b1.classList.toggle('sel', !many); bN.classList.toggle('sel', many);
+    modeHint.textContent = t(secure ? 'secureHint' : 'fastHint');
+    whoHint.textContent = t(many ? 'whoManyHint' : 'whoOneHint');
+    lifeF.hidden = secure;
   };
-  pick(false);
+  upd();
+  const create = h('button.primary.wide', t('create')) as HTMLButtonElement;
+  create.onclick = async () => {
+    create.disabled = true;
+    const o = { name: name.value.trim(), secure, life: +life.value, invTtl: +inv.value };
+    if (many) { const l = await app.createLobby({ kind: 'chat', ...o }); go('l=' + l.rec.id, true); }
+    else { const r = await app.createRoom(o); go('r=' + r.rec.id, true); }
+  };
   mount(h('div.page', bar(t('newChat')), h('main.body',
-    h('div.segs', bF, bS), hint,
-    field(t('roomName'), name), lifeF, field(t('invTtl'), inv),
-    h('label.check', reuse, h('span', t('reusable'))),
-    h('button.primary.wide', { onclick: async () => {
-      const r = await app.createRoom({ name: name.value.trim(), secure, life: +life.value, invTtl: +inv.value, reusable: reuse.checked });
-      go('r=' + r.rec.id, true);
-    } }, t('create')))));
+    h('div.segs', bF, bS), modeHint,
+    h('span.lbl', t('who')), h('div.segs', b1, bN), whoHint,
+    field(t('roomName'), name), lifeF, field(t('invTtl'), inv), create)));
 }
 
 // ---------- pairing: owner accepts a device ----------
@@ -249,6 +308,7 @@ function settingsView() {
     h('button.danger', { onclick: async () => {
       if (!confirm(t('resetAsk'))) return;
       for (const r of [...app.rooms.values()]) { r.bye(true); app.removeRoom(r); }
+      for (const l of [...app.lobbies.values()]) await app.removeLobby(l);
       try { localStorage.clear(); sessionStorage.clear(); indexedDB.deleteDatabase('vzhooh'); } catch { /* ignore */ }
       setTimeout(() => { location.hash = ''; location.reload(); }, 400);
     } }, t('resetAll')),

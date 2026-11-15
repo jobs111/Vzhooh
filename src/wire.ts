@@ -158,12 +158,18 @@ class Conn {
 export class Wire extends Emitter {
   conns: Conn[] = [];
   antiFreeze: AntiFreeze = 'auto';
+  downSince = now();
+  private wasDown = false;
   private subs = new Map<string, Handler>();
   private timer: any;
 
   start(urls: string[]) {
     for (const u of urls) this.add(u);
-    if (!this.timer) this.timer = setInterval(() => this.conns.forEach(c => c.tick()), 1500);
+    if (!this.timer) this.timer = setInterval(() => {
+      this.conns.forEach(c => c.tick());
+      const d = this.down;
+      if (d !== this.wasDown) { this.wasDown = d; this.emit('change'); }   // grace period over: let the UI show it at once
+    }, 1000);
   }
   add(url: string) {
     if (this.conns.some(c => c.url === url)) return;
@@ -193,7 +199,12 @@ export class Wire extends Emitter {
   }
   get upCount() { return this.conns.filter(c => c.up).length; }
   get buffered() { return Math.max(0, ...this.conns.map(c => c.m?.buffered || 0)); }
-  changed() { this.emit('change'); }
+  /** No relay connection for more than a few seconds (short gaps while connecting are not shown). */
+  get down() { return this.upCount === 0 && !!this.downSince && now() - this.downSince > 3500; }
+  changed() {
+    if (this.upCount) this.downSince = 0; else if (!this.downSince) this.downSince = now();
+    this.emit('change');
+  }
   kick() { this.conns.forEach(c => c.kick()); }
   private probedAt = 0;
   /** Deliveries are timing out: check quickly whether the connections are still alive. */

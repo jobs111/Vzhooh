@@ -12,9 +12,9 @@ let failed = 0;
 const ok = (name, cond, extra = '') => { console.log((cond ? '  ✓ ' : '  ✗ ') + name + (extra ? ' — ' + extra : '')); if (!cond) failed++; };
 const only = process.argv[2];
 
-async function ctx(browser, conf = {}) {
-  const c = await browser.newContext({ permissions: ['microphone', 'camera', 'clipboard-read', 'clipboard-write'], locale: 'ru-RU', viewport: { width: 420, height: 800 } });
-  const all = { brokers: process.env.REAL ? ['wss://public:public@public.cloud.shiftr.io'] : [`ws://127.0.0.1:${MQ}`], ice: [], lang: 'ru', ...conf };
+async function ctx(browser, conf = {}, viewport = { width: 420, height: 800 }) {
+  const c = await browser.newContext({ permissions: ['microphone', 'camera', 'clipboard-read', 'clipboard-write'], locale: 'ru-RU', viewport, acceptDownloads: true });
+  const all = { brokers: process.env.REAL ? ['wss://public:public@public.cloud.shiftr.io'] : [`ws://127.0.0.1:${MQ}`], ice: [], lang: 'ru', debug: true, ...conf };
   await c.addInitScript(cfg => { for (const [k, v] of Object.entries(cfg)) if (localStorage.getItem('vz.' + k) == null) localStorage.setItem('vz.' + k, JSON.stringify(v)); }, all);
   const p = await c.newPage();
   p.on('pageerror', e => { console.log('   [pageerror]', e.message); failed++; });
@@ -34,7 +34,7 @@ async function makeRoom(host, { secure = false } = {}) {
   return host.inputValue('#invite-url');
 }
 async function pair(browser, opts = {}) {
-  const host = await ctx(browser, opts.hostConf), guest = await ctx(browser, opts.guestConf);
+  const host = await ctx(browser, opts.hostConf, opts.vp), guest = await ctx(browser, opts.guestConf, opts.vp);
   const link = await makeRoom(host, opts);
   await guest.goto(link);
   const up = await until(async () => { const a = await st(host), b = await st(guest); return a && b && a.state === 'up' && b.state === 'up' && a.online && b.online; });
@@ -42,6 +42,24 @@ async function pair(browser, opts = {}) {
 }
 const sendText = async (p, text) => { await p.fill('textarea', text); await p.keyboard.press('Enter'); };
 const hasText = (p, text) => until(() => p.evaluate(x => [...document.querySelectorAll('.msg .txt')].some(e => e.textContent === x), text));
+
+const jsQR = require('jsqr');
+const sha = b => require('crypto').createHash('sha256').update(b).digest('hex');
+const rndFile = (name, size) => { const d = require('crypto').randomBytes(size); fs.writeFileSync(path.join(OUT, name), d); return { file: path.join(OUT, name), hash: sha(d) }; };
+/** Read the QR code drawn on a canvas the way a phone camera would. */
+async function scanQr(page, selector) {
+  const img = await page.evaluate(sel => { const c = document.querySelector(sel); const d = c.getContext('2d').getImageData(0, 0, c.width, c.height); return { w: c.width, h: c.height, data: Array.from(d.data) }; }, selector);
+  const r = jsQR(Uint8ClampedArray.from(img.data), img.w, img.h);
+  return r && r.data;
+}
+const hashOf = (p, name) => until(() => p.evaluate(async n => {
+  const all = [...__vz.rooms.values()].flatMap(r => [...r.xfer.inc.values()]);
+  const i = all.find(x => x.name === n);
+  if (!i || i.state !== 'done') return null;
+  const h = await crypto.subtle.digest('SHA-256', await i.blob.arrayBuffer());
+  return [...new Uint8Array(h)].map(x => x.toString(16).padStart(2, '0')).join('');
+}, name), 40000, 300);
+const stOf = (p, filter) => p.evaluate(f => [...__vz.rooms.values()].filter(r => !f || (f === 'lobby' ? r.rec.lid : true)).map(r => ({ id: r.rec.id, state: r.state, online: r.online, direct: r.direct, n: r.msgs.length, reject: r.reject, lid: r.rec.lid, share: r.rec.share })), filter);
 
 const tests = {
   async basic(browser) {
@@ -122,6 +140,211 @@ const tests = {
     ok('hostile text shown as plain text', !!(await hasText(host, '<img src=x onerror=window.__pwn=1>')));
     await host.waitForTimeout(500);
     ok('no script executed', !(await host.evaluate(() => !!window.__pwn)) && await host.evaluate(() => !document.querySelector('.msgs img[src=x]')));
+  },
+  async scroll(browser) {
+    const vp = { width: 360, height: 640 };
+    const { host, guest, up } = await pair(browser, { vp });
+    ok('session (phone screen 360×640)', !!up);
+    await host.evaluate(() => { const r = [...__vz.rooms.values()][0]; for (let i = 0; i < 70; i++) r.sendText('сообщение номер ' + i + ' ' + 'текст '.repeat(i % 7)); });
+    ok('70 messages arrive', !!(await until(async () => (await st(guest)).n >= 70, 20000)));
+    await guest.waitForTimeout(400);
+    const g = await guest.evaluate(() => { const l = document.getElementById('msgs'), c = document.querySelector('.composer').getBoundingClientRect(); return { sh: l.scrollHeight, ch: l.clientHeight, top: l.scrollTop, comp: c.bottom, doc: document.scrollingElement.scrollHeight, ih: innerHeight }; });
+    ok('message list is a real scroll area', g.sh > g.ch + 500 && g.ch > 250, JSON.stringify(g));
+    ok('opens at the newest message', g.top + g.ch >= g.sh - 4);
+    ok('composer stays on screen', g.comp <= vp.height + 1);
+    ok('page itself does not scroll (no double scroll)', g.doc <= g.ih + 1);
+    await guest.mouse.move(180, 300);
+    await guest.mouse.wheel(0, -2500);
+    await guest.waitForTimeout(400);
+    const top2 = await guest.evaluate(() => document.getElementById('msgs').scrollTop);
+    ok('wheel/swipe scrolls the list up', top2 < g.top - 1500, g.top + ' → ' + top2);
+    await host.evaluate(() => [...__vz.rooms.values()][0].sendText('новое внизу'));
+    await guest.waitForTimeout(800);
+    ok('reading history is not interrupted by a new message', Math.abs((await guest.evaluate(() => document.getElementById('msgs').scrollTop)) - top2) < 5);
+    // home with many chats
+    await host.evaluate(async () => { for (let i = 0; i < 25; i++) await __vz.createRoom({ name: 'Чат ' + i, secure: false, life: 3600e3, invTtl: 3600e3 }); });
+    const saved = await until(() => host.evaluate(() => new Promise(r => { const q = indexedDB.open('vzhooh'); q.onsuccess = () => { const c = q.result.transaction('rooms').objectStore('rooms').count(); c.onsuccess = () => r(c.result >= 26); }; })), 8000);
+    ok('26 chats saved on the device', !!saved);
+    await host.goto(URL0);
+    await host.waitForTimeout(500);
+    await until(() => host.evaluate(() => document.querySelectorAll('.rooms .room').length >= 26), 8000);
+    const hm = await host.evaluate(() => { const b = document.querySelector('.body'); return { sh: b.scrollHeight, ch: b.clientHeight, rooms: document.querySelectorAll('.rooms .room').length, all: __vz.visibleRooms.length }; });
+    ok('home screen list scrolls', hm.sh > hm.ch + 300, JSON.stringify(hm));
+    await host.mouse.move(180, 400);
+    await host.mouse.wheel(0, 20000);
+    await host.waitForTimeout(400);
+    ok('bottom of home reachable', await host.evaluate(() => { const f = document.querySelector('.foot').getBoundingClientRect(); return f.bottom <= innerHeight + 1 && f.top >= 0; }));
+    // settings: the last button must be reachable
+    await host.goto(URL0 + '#set');
+    await host.mouse.move(180, 400);
+    await host.mouse.wheel(0, 20000);
+    await host.waitForTimeout(400);
+    ok('bottom of settings reachable', await host.evaluate(() => { const f = document.querySelector('.foot').getBoundingClientRect(); return f.bottom <= innerHeight + 1; }));
+    // a fresh chat with the invite panel open on a small screen
+    await host.goto(URL0 + '#new');
+    await host.getByRole('button', { name: 'Создать' }).click();
+    await host.waitForSelector('#invite-url');
+    const pv = await host.evaluate(() => ({ comp: document.querySelector('.composer').getBoundingClientRect().bottom, panel: document.querySelector('.panel').getBoundingClientRect().height }));
+    ok('invite panel fits and composer visible', pv.comp <= vp.height + 1 && pv.panel > 150, JSON.stringify(pv));
+    await guest.screenshot({ path: path.join(OUT, 'phone-chat.png') });
+    await host.screenshot({ path: path.join(OUT, 'phone-invite.png') });
+  },
+  async qr(browser) {
+    const p = await ctx(browser);
+    await p.goto(URL0);
+    await p.click('#act-qr');
+    await p.fill('#qr-input', 'https://vk.com/vzhooh_test?x=1&y=привет');
+    await p.waitForSelector('canvas.qr');
+    await p.waitForTimeout(300);
+    ok('QR from a link scans back to the same text', (await scanQr(p, 'canvas.qr')) === 'https://vk.com/vzhooh_test?x=1&y=привет');
+    const dl = p.waitForEvent('download');
+    await p.getByRole('button', { name: /Скачать PNG/ }).click();
+    const d = await dl;
+    const png = await fs.promises.readFile(await d.path());
+    ok('PNG download works', d.suggestedFilename() === 'qr.png' && png.slice(1, 4).toString() === 'PNG' && png.length > 2000, png.length + ' B');
+    await p.getByRole('button', { name: /На весь экран/ }).click();
+    ok('full-screen QR opens', await p.locator('.qrfull canvas').count() === 1);
+    await p.click('.qrfull');
+    ok('full-screen QR closes on tap', await p.locator('.qrfull').count() === 0);
+    await p.reload();
+    ok('last text remembered', (await p.inputValue('#qr-input')).startsWith('https://vk.com/'));
+    // invite QR codes must scan to the invite link
+    const link = await makeRoom(p);
+    ok('invite QR scans to the invite link', (await scanQr(p, '.panel canvas.qr')) === link);
+  },
+  async lobby(browser) {
+    const host = await ctx(browser);
+    await host.goto(URL0);
+    await host.click('#act-chat');
+    await host.click('#who-many');
+    await host.getByRole('button', { name: 'Создать' }).click();
+    await host.waitForSelector('#lobby-url');
+    const link = await host.inputValue('#lobby-url');
+    ok('one QR for many devices created', link.includes('#j='));
+    ok('lobby QR scans to its link', (await scanQr(host, '.invite canvas.qr')) === link);
+    const gs = [];
+    for (let i = 0; i < 3; i++) { const g = await ctx(browser); await g.goto(link); gs.push(g); }
+    const allUp = await until(async () => { for (const g of gs) { const s = await st(g); if (!s || s.state !== 'up' || !s.online) return false; } return true; }, 25000);
+    ok('3 devices connected with one QR', !!allUp);
+    ok('owner has 3 separate chats', (await stOf(host, 'lobby')).length === 3);
+    for (let i = 0; i < 3; i++) await sendText(gs[i], 'я устройство ' + i);
+    const sep = await until(async () => {
+      const rows = await host.evaluate(() => [...__vz.rooms.values()].filter(r => r.rec.lid).map(r => r.msgs.filter(m => !m.mine).map(m => m.text)));
+      return rows.length === 3 && rows.every(x => x.length === 1) && new Set(rows.map(x => x[0])).size === 3;
+    }, 15000);
+    ok('each device talks only in its own chat', !!sep);
+    await host.waitForSelector('.rooms .room');
+    ok('lobby screen lists the devices', await host.locator('.rooms .room').count() === 3);
+    await gs[0].reload();
+    await until(async () => (await st(gs[0]))?.state === 'up', 15000);
+    await gs[0].goto(link);
+    await gs[0].waitForTimeout(2500);
+    ok('reopening the link returns to the same chat (no duplicate)', (await stOf(gs[0])).length === 1 && (await stOf(host, 'lobby')).length === 3);
+    // reply from the owner reaches only that device
+    await host.evaluate(() => { const r = [...__vz.rooms.values()].find(r => r.rec.lid && r.msgs.some(m => m.text === 'я устройство 1')); r.sendText('ответ второму'); });
+    ok('owner reply reaches the right device', !!(await hasText(gs[1], 'ответ второму')));
+    await gs[2].waitForTimeout(800);
+    ok('…and not the others', !(await gs[2].evaluate(() => [...document.querySelectorAll('.msg .txt')].some(e => e.textContent === 'ответ второму'))));
+    // expired lobby refuses new devices
+    await host.evaluate(() => { const l = [...__vz.lobbies.values()][0]; l.rec.invExp = Date.now() - 1000; });
+    const late = await ctx(browser);
+    await late.goto(link.replace(/#j=.*/, '') + '#j=' + link.split('#j=')[1]);
+    const rej = await until(async () => (await st(late))?.reject, 15000);
+    ok('expired shared invite refuses new devices', rej === 'exp', String(rej));
+  },
+  async share(browser) {
+    const host = await ctx(browser);
+    await host.goto(URL0);
+    await host.click('#act-share');
+    const big = rndFile('presentation.pdf', 3 * 1024 * 1024), small = rndFile('notes.txt', 2500);
+    await host.setInputFiles('#share-files', [big.file, small.file]);
+    await host.fill('textarea', 'Материалы встречи https://example.com/agenda');
+    await host.click('#share-create');
+    await host.waitForSelector('#lobby-url');
+    const link = await host.inputValue('#lobby-url');
+    const a = await ctx(browser), b = await ctx(browser, { nop2p: true });
+    await Promise.all([a.goto(link), b.goto(link)]);
+    ok('guest A downloads the 3 MB file intact', (await hashOf(a, 'presentation.pdf')) === big.hash);
+    ok('guest A downloads the small file intact', (await hashOf(a, 'notes.txt')) === small.hash);
+    ok('guest A sees the caption with a link', !!(await until(() => a.evaluate(() => !!document.querySelector('.notes a[href="https://example.com/agenda"]')))));
+    ok('relay-only guest B gets the small file', (await hashOf(b, 'notes.txt')) === small.hash);
+    ok('B is told the big file needs a direct link', !!(await until(() => b.evaluate(() => document.body.textContent.includes('прямого соединения')))));
+    ok('download counter on the owner side', !!(await until(() => host.evaluate(() => [...__vz.lobbies.values()][0].rec.dl >= 3), 10000)));
+    await a.screenshot({ path: path.join(OUT, 'share-guest.png') });
+    await host.screenshot({ path: path.join(OUT, 'share-host.png') });
+    ok('A has a working save button', await a.locator('a.btn[download="presentation.pdf"]').count() === 1);
+    ok('guest sees the share name', !!(await until(() => a.evaluate(() => document.querySelector('.bar .ttl').textContent.includes('presentation.pdf')))));
+    await a.reload();
+    ok('reloaded download page reconnects to the share', (await hashOf(a, 'presentation.pdf')) === big.hash);
+    // owner restarts the app: the share survives and keeps serving
+    await host.reload();
+    await host.waitForTimeout(1500);
+    const c = await ctx(browser);
+    await c.goto(link);
+    ok('after owner restart a new guest still gets the file', (await hashOf(c, 'presentation.pdf')) === big.hash);
+    ok('no duplicated files after the owner restart', (await a.evaluate(() => document.querySelectorAll('.fcard').length)) === 2);
+    await host.goto(URL0 + '#l=' + (await host.evaluate(() => [...__vz.lobbies.keys()][0])));
+    await host.click('#lobby-del');
+    ok('share deleted with its rooms', !!(await until(() => host.evaluate(() => __vz.lobbies.size === 0 && ![...__vz.rooms.values()].some(r => r.rec.share)), 8000)));
+  },
+  async callroom(browser) {
+    const host = await ctx(browser), guest = await ctx(browser);
+    await host.goto(URL0);
+    await host.click('#act-call');
+    await host.click('#call-video');
+    await host.waitForSelector('#invite-url');
+    ok('call room shows its invite', (await host.textContent('.panel')).includes('Комната для звонка'));
+    await host.evaluate(() => {
+      navigator.mediaDevices.getDisplayMedia = async () => {
+        const c = document.createElement('canvas'); c.width = 640; c.height = 360; const g = c.getContext('2d');
+        setInterval(() => { g.fillStyle = '#' + Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, '0'); g.fillRect(0, 0, 640, 360); }, 80);
+        return c.captureStream(15);
+      };
+    });
+    await guest.goto(await host.inputValue('#invite-url'));
+    ok('guest gets rung automatically', !!(await until(async () => (await st(guest))?.call === 'in', 20000)));
+    await guest.click('#call-accept-video');
+    ok('call is on', !!(await until(async () => (await st(host)).call === 'on' && (await st(guest)).call === 'on', 10000)));
+    const frames = p => p.evaluate(async () => { const r = [...__vz.rooms.values()][0]; let v = 0, a = 0; (await r.rtc.pc.getStats()).forEach(x => { if (x.type === 'inbound-rtp') { if (x.kind === 'video') v = x.framesDecoded || 0; if (x.kind === 'audio') a = x.packetsReceived || 0; } }); return { v, a }; });
+    ok('audio + video both ways', !!(await until(async () => { const x = await frames(host), y = await frames(guest); return x.v > 5 && y.v > 5 && x.a > 20 && y.a > 20; }, 15000, 500)));
+    await host.click('#call-screen');
+    ok('screen sharing starts', !!(await until(() => host.evaluate(() => [...__vz.rooms.values()][0].call.scr), 8000)));
+    const v0 = (await frames(guest)).v;
+    ok('guest receives the shared screen', !!(await until(async () => (await frames(guest)).v > v0 + 15, 10000, 500)));
+    await host.click('#call-screen');
+    ok('screen sharing stops (back to camera)', !!(await until(() => host.evaluate(() => { const r = [...__vz.rooms.values()][0]; return !r.call.scr && r.rtc.local.getVideoTracks().length === 1; }), 8000)));
+    await host.click('#call-end');
+    ok('call ends; no automatic re-dial', !!(await until(async () => (await st(guest)).call === 'idle', 8000)) && (await host.evaluate(() => [...__vz.rooms.values()][0].rec.called)));
+  },
+  async extras(browser) {
+    const { host, guest, up } = await pair(browser);
+    ok('session', !!up);
+    await sendText(host, 'удали меня');
+    await sendText(host, 'останусь');
+    ok('messages arrive', !!(await hasText(guest, 'останусь')));
+    await host.locator('.msg.me .txt', { hasText: 'удали меня' }).click();
+    await host.getByRole('button', { name: /Удалить у всех/ }).click();
+    const gone = await until(async () => !(await guest.evaluate(() => [...document.querySelectorAll('.msg .txt')].some(e => e.textContent === 'удали меня'))) && !(await host.evaluate(() => [...document.querySelectorAll('.msg .txt')].some(e => e.textContent === 'удали меня'))), 8000);
+    ok('"delete for everyone" removes it on both sides', !!gone);
+    ok('other messages stay', !!(await hasText(guest, 'останусь')));
+    await guest.locator('.msg .txt', { hasText: 'останусь' }).click();
+    await guest.getByRole('button', { name: /Копировать/ }).click();
+    ok('copy text works', (await guest.evaluate(() => navigator.clipboard.readText())) === 'останусь');
+  },
+  async reconnect(browser, env) {
+    const { host, guest, up } = await pair(browser, { hostConf: { nop2p: true }, guestConf: { nop2p: true } });
+    ok('session via relay', !!up);
+    await env.mq.close();
+    ok('outage shown: "reconnecting"', !!(await until(() => host.evaluate(() => { const n = document.querySelector('.netbar'); return n && !n.hidden && n.textContent.includes('переподключаюсь'); }), 12000)));
+    ok('chat status says reconnecting', !!(await until(async () => (await host.textContent('.bar .sub')).includes('переподключ'), 4000)));
+    await sendText(host, 'написано без связи');
+    env.mq = await broker(MQ);
+    const btn = host.getByRole('button', { name: 'Переподключить сейчас' });
+    if (await btn.isVisible()) await btn.click({ timeout: 3000 }).catch(() => {});   // it may already have reconnected by itself
+    await guest.evaluate(() => __vz.kick());
+    ok('connection restored automatically', !!(await until(async () => { const a = await st(host), b = await st(guest); return a.online && b.online && a.state === 'up'; }, 30000)));
+    ok('message written offline is delivered', !!(await hasText(guest, 'написано без связи')));
+    ok('banner disappears', !!(await until(() => host.evaluate(() => document.querySelector('.netbar').hidden), 6000)));
   },
   async relay(browser) {
     const { host, guest, up } = await pair(browser, { hostConf: { nop2p: true }, guestConf: { nop2p: true } });
@@ -269,17 +492,17 @@ const tests = {
 (async () => {
   fs.mkdirSync(OUT, { recursive: true });
   const web = await serve(DIST, WEB);
-  const mq = await broker(MQ);
+  const env = { mq: await broker(MQ) };
   const browser = await chromium.launch({ proxy: process.env.REAL ? { server: process.env.HTTPS_PROXY, bypass: '127.0.0.1,localhost' } : undefined, args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream', '--disable-features=WebRtcHideLocalIpsWithMdns', '--autoplay-policy=no-user-gesture-required'] });
   for (const [name, fn] of Object.entries(tests)) {
     if (only && name !== only) continue;
     console.log('▶ ' + name);
     const t0 = Date.now();
-    try { await fn(browser, { mq }); } catch (e) { console.log('  ✗ exception: ' + (e.stack || e).toString().split('\n').slice(0, 4).join(' | ')); failed++; }
+    try { await fn(browser, env); } catch (e) { console.log('  ✗ exception: ' + (e.stack || e).toString().split('\n').slice(0, 4).join(' | ')); failed++; }
     for (const c of browser.contexts()) await c.close();
     console.log('  (' + ((Date.now() - t0) / 1000).toFixed(1) + ' s)');
   }
-  await browser.close(); await mq.close(); web.close();
+  await browser.close(); await env.mq.close(); web.close();
   console.log(failed ? `\nFAILED: ${failed}` : '\nALL PASSED');
   process.exit(failed ? 1 : 0);
 })();

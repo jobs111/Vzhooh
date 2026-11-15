@@ -210,6 +210,34 @@ export class Rtc {
     if (x) await x.replaceTrack(v); else await this.attach(true);
   }
 
+  /** Replace (or add / remove) the outgoing video track. */
+  private async putVideo(tr: MediaStreamTrack | null) {
+    const s = this.local;
+    if (!s || this.closed) { tr?.stop(); return; }
+    const old = s.getVideoTracks()[0];
+    const x = old ? this.pc.getSenders().find(q => q.track === old) : undefined;
+    if (old) { old.stop(); s.removeTrack(old); }
+    if (tr) s.addTrack(tr);
+    if (x) await x.replaceTrack(tr);
+    else if (tr) await this.attach(true);
+    this.tune();
+  }
+  /** Screen sharing (desktop browsers). onEnd fires when the user stops it from the browser's own bar. */
+  async startScreen(onEnd: () => void) {
+    const md: any = navigator.mediaDevices;
+    if (!md?.getDisplayMedia) throw new Error('noscreen');
+    const ds: MediaStream = await md.getDisplayMedia({ video: { frameRate: { ideal: 15, max: 30 } }, audio: false });
+    const tr = ds.getVideoTracks()[0];
+    try { (tr as any).contentHint = 'detail'; } catch { /* ignore */ }
+    tr.addEventListener('ended', onEnd, { once: true });
+    await this.putVideo(tr);
+  }
+  async stopScreen(backToCam: boolean) {
+    let cam: MediaStreamTrack | null = null;
+    if (backToCam) { try { cam = (await navigator.mediaDevices.getUserMedia({ video: videoC(this.facing) })).getVideoTracks()[0]; } catch { cam = null; } }
+    await this.putVideo(cam);
+  }
+
   close() {
     if (this.closed) return;
     this.closed = true;

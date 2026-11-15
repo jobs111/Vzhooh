@@ -15,6 +15,7 @@
   },
   "devDependencies": {
     "aedes": "^1.2.0",
+    "jsqr": "^1.4.0",
     "typescript": "5.9",
     "vite": "^8.3.8",
     "ws": "^8.23.0"
