@@ -212,6 +212,47 @@ const tests = {
     const link = await makeRoom(p);
     ok('invite QR scans to the invite link', (await scanQr(p, '.panel canvas.qr')) === link);
   },
+  async qrtext(browser) {
+    const p = await ctx(browser), reader = await ctx(browser);
+    await p.goto(URL0 + '#qr');
+    const scanAll = async () => { const n = await p.locator('.qrcard canvas').count(); const out = []; for (let i = 0; i < n; i++) out.push(await scanQr(p, `.qrcard:nth-child(${i + 1}) canvas`)); return out; };
+    // 1. short text → one code → opens as a page with the same text
+    const short = 'Встреча в 18:30 у входа.\nПароль от Wi‑Fi: «Кот_2026» 🙂';
+    await p.fill('#qr-input', short);
+    await p.waitForSelector('.qrcard canvas'); await p.waitForTimeout(400);
+    let codes = await scanAll();
+    ok('short text: one code that scans', codes.length === 1 && !!codes[0] && codes[0].includes('#t='));
+    await reader.goto(codes[0]);
+    ok('scanned code opens the exact text in the browser', (await reader.textContent('#tv-text')) === short);
+    const dl = reader.waitForEvent('download'); await reader.click('#tv-save');
+    ok('text can be saved as .txt', (await fs.promises.readFile(await (await dl).path(), 'utf8')) === short);
+    // 2. long text → numbered series; scanning in a shuffled order assembles it
+    let long = ''; for (let i = 0; i < 260; i++) long += `Строка ${i}: ${require('crypto').randomBytes(9).toString('base64')} — проверка длинного текста, ёЁ, «кавычки», emoji 🚀.\n`;
+    long = long.trim();
+    await p.fill('#qr-input', long);
+    await until(async () => (await p.locator('.qrcard canvas').count()) > 3, 8000); await p.waitForTimeout(500);
+    codes = await scanAll();
+    ok('long text (' + long.length + ' chars) → series of codes, every one scans', codes.length > 3 && codes.every(c => c && c.includes('#t=')), codes.length + ' codes');
+    const order = codes.map((c, i) => i).sort(() => Math.random() - 0.5);
+    for (let k = 0; k < order.length; k++) {
+      await reader.goto(codes[order[k]]); await reader.reload(); await reader.waitForSelector('#tv-wait, #tv-text');
+      if (k < order.length - 1 && k === 0) ok('partial series shows progress', (await reader.textContent('#tv-wait')).includes('1 из ' + codes.length));
+    }
+    ok('series assembles into the exact long text', (await reader.textContent('#tv-text')) === long);
+    // 3. plain mode: the code holds the text itself
+    await p.click('#qr-plain'); await p.fill('#qr-input', 'просто текст ✓'); await p.waitForTimeout(500);
+    ok('plain mode: code holds the text itself', (await scanAll())[0] === 'просто текст ✓');
+    // 4. a bare link is always encoded as is
+    await p.click('#qr-link'); await p.fill('#qr-input', 'https://vk.com/id1?x=я'); await p.waitForTimeout(500);
+    ok('bare link is encoded as is (opens directly)', (await scanAll())[0] === 'https://vk.com/id1?x=я');
+    // 5. without the internet
+    await p.context().setOffline(true);
+    await p.fill('#qr-input', 'офлайн-текст ' + 'я'.repeat(900)); await p.waitForTimeout(700);
+    codes = await scanAll();
+    ok('codes are generated without the internet', codes.length >= 1 && codes.every(Boolean));
+    await p.context().setOffline(false);
+    await p.screenshot({ path: path.join(OUT, 'qrtext.png') });
+  },
   async lobby(browser) {
     const host = await ctx(browser);
     await host.goto(URL0);
@@ -268,7 +309,7 @@ const tests = {
     ok('guest A downloads the small file intact', (await hashOf(a, 'notes.txt')) === small.hash);
     ok('guest A sees the caption with a link', !!(await until(() => a.evaluate(() => !!document.querySelector('.notes a[href="https://example.com/agenda"]')))));
     ok('relay-only guest B gets the small file', (await hashOf(b, 'notes.txt')) === small.hash);
-    ok('B is told the big file needs a direct link', !!(await until(() => b.evaluate(() => document.body.textContent.includes('прямого соединения')))));
+    ok('relay-only guest B gets the 3 MB file through the relay', (await hashOf(b, 'presentation.pdf')) === big.hash);
     ok('download counter on the owner side', !!(await until(() => host.evaluate(() => [...__vz.lobbies.values()][0].rec.dl >= 3), 10000)));
     await a.screenshot({ path: path.join(OUT, 'share-guest.png') });
     await host.screenshot({ path: path.join(OUT, 'share-host.png') });
@@ -472,6 +513,117 @@ const tests = {
     await host.getByRole('button', { name: 'Отмена' }).click();
     await host.waitForTimeout(600);
     ok('cancel sends nothing', (await st(guest)).n === before && await host.locator('#c-sheet').count() === 0);
+  },
+  async russia(browser, env) {
+    // the direct link is attempted again and again but never succeeds (strict NAT / VPN), everything goes through the relay
+    const nd = { nodirect: true };
+    const { host, guest, up } = await pair(browser, { hostConf: nd, guestConf: nd });
+    ok('session, no direct link possible', !!up);
+    await host.waitForTimeout(3000);
+    ok('still no direct link (as on mobile networks)', !(await st(host)).direct && !(await st(guest)).direct);
+    const rs = p => p.evaluate(() => { const s = [...__vz.rooms.values()][0].relayStats; return s ? { ...s } : null; });
+    await host.click('button[title="Звонок"]');
+    ok('ring arrives quickly', !!(await until(async () => (await st(guest)).call === 'in', 4000)));
+    await guest.click('#call-accept');
+    ok('call connects', !!(await until(async () => { const a = await rs(host), b = await rs(guest); return a && b && a.rx > 10 && b.rx > 10; }, 10000)));
+    // watch the call for 50 s: it must not drop, re-dial or go silent while the app keeps trying to get a direct link
+    let worstGap = 0, last = (await rs(host)).rx, lastT = Date.now(), dropped = false;
+    for (let i = 0; i < 50; i++) {
+      await host.waitForTimeout(1000);
+      const a = await rs(host), sa = await st(host), sb = await st(guest);
+      if (!a || sa.call !== 'on' || sb.call !== 'on') { dropped = true; break; }
+      if (a.rx > last) { last = a.rx; lastT = Date.now(); } else worstGap = Math.max(worstGap, Date.now() - lastT);
+    }
+    ok('call stays up for 50 s despite direct-link retries', !dropped);
+    ok('voice keeps flowing (no silent gaps over 2 s)', worstGap < 2000, 'worst gap ' + worstGap + ' ms');
+    ok('audible on both sides', (await rs(host)).rxPeak > 0.01 && (await rs(guest)).rxPeak > 0.01);
+    await host.click('#call-cam');
+    ok('camera in a relay call: snapshots reach the other side', !!(await until(() => guest.evaluate(() => { const i = document.querySelector('img.rimg'); return i && !i.hidden && i.naturalWidth > 100; }), 10000)));
+    ok('own camera preview shown', !!(await until(() => host.evaluate(() => { const v = document.querySelector('video.local'); return !v.hidden && v.videoWidth > 0; }), 6000)));
+    await host.screenshot({ path: path.join(OUT, 'relay-call.png') });
+    await host.click('#call-cam');
+    await guest.click('#call-end');
+    ok('hang-up ends it on both sides', !!(await until(async () => (await st(host)).call === 'idle' && (await st(guest)).call === 'idle', 6000)));
+    await host.waitForTimeout(4000);
+    ok('no ghost re-dial after the call', (await st(host)).call === 'idle' && (await st(guest)).call === 'idle');
+    // caller hangs up at once: the other side must not start ringing later
+    await host.evaluate(async () => { const r = [...__vz.rooms.values()][0]; await r.callStart(false); r.callEnd(); });
+    await guest.waitForTimeout(5000);
+    ok('cancelled call does not ring afterwards', (await st(guest)).call === 'idle');
+  },
+  async latering(browser, env) {
+    const nd = { nodirect: true };
+    const { host, guest, up } = await pair(browser, { hostConf: nd, guestConf: nd });
+    ok('session', !!up);
+    const rs = p => p.evaluate(() => { const s = [...__vz.rooms.values()][0].relayStats; return s ? { ...s } : null; });
+    // the ring is delayed by the network: relay freezes, caller gives up, relay comes back
+    env.mq.state.drop = true;
+    await host.evaluate(() => [...__vz.rooms.values()][0].callStart(false));
+    await host.waitForTimeout(2500);
+    await host.evaluate(() => [...__vz.rooms.values()][0].callEnd());
+    env.mq.state.drop = false;
+    await guest.waitForTimeout(9000);
+    ok('late ring of an abandoned call is not shown', (await st(guest)).call === 'idle');
+    // lost signalling messages: the ring and the answer never arrive, the heartbeat must repair both
+    await host.evaluate(() => { const r = [...__vz.rooms.values()][0]; const s = r.send.bind(r); r.send = x => (x.t === 'c' && (x.a === 'ring' || x.a === 'acc')) ? undefined : s(x); });
+    await guest.evaluate(() => { const r = [...__vz.rooms.values()][0]; const s = r.send.bind(r); r.send = x => (x.t === 'c' && (x.a === 'ring' || x.a === 'acc')) ? undefined : s(x); });
+    await host.click('button[title="Звонок"]');
+    ok('rings although the ring message was lost', !!(await until(async () => (await st(guest)).call === 'in', 6000)));
+    await guest.click('#call-accept');
+    ok('connects although the answer message was lost', !!(await until(async () => { const a = await rs(host), b = await rs(guest); return (await st(host)).call === 'on' && a && b && a.rx > 10 && b.rx > 10; }, 10000)));
+    await host.click('#call-end');
+    await until(async () => (await st(guest)).call === 'idle', 6000);
+    // and a normal call works right after that
+    if (process.env.DBG) for (const [n, p] of [['G', guest], ['H', host]]) { p.on('console', m => { if (m.text().startsWith('DBG')) console.log('   ', n, m.text()); }); await p.evaluate(() => { const r = [...__vz.rooms.values()][0]; const o = r.onOp.bind(r); r.onOp = (x, d) => { if (x.t === 'c' || x.t === 'a') console.log('DBG in', JSON.stringify(x), 'call=' + r.call.st + '/' + r.call.id); return o(x, d); }; const s = r.send.bind(r); r.send = x => { if (x.t === 'c') console.log('DBG out', JSON.stringify(x)); return s(x); }; }); }
+    await guest.click('button[title="Звонок"]');
+    ok('next call rings normally', !!(await until(async () => (await st(host)).call === 'in', 15000)));
+    await host.click('#call-accept');
+    const nc = await until(async () => { const a = await rs(guest); return a && a.rx > 10; }, 12000);
+    ok('next call connects', !!nc, nc ? '' : JSON.stringify({ h: await st(host), g: await st(guest), hs: await rs(host), gs: await rs(guest), w: await guest.evaluate(() => __vz.wire.conns.map(c => [c.up, c.curtain, c.rotateAt])) }));
+    await host.click('#call-end');
+  },
+  async curtaincall(browser, env) {
+    env.mq.state.curtain = 16000;
+    const nd = { nodirect: true };
+    const { host, guest, up } = await pair(browser, { hostConf: nd, guestConf: nd });
+    ok('session under the 16 KB curtain', !!up);
+    const rs = p => p.evaluate(() => { const s = [...__vz.rooms.values()][0].relayStats; return s ? { ...s } : null; });
+    await host.click('button[title="Звонок"]');
+    await until(async () => (await st(guest)).call === 'in', 15000);
+    await guest.click('#call-accept');
+    await until(async () => { const a = await rs(host); return a && a.rx > 5; }, 15000);
+    const a0 = (await rs(host)).rx, b0 = (await rs(guest)).rx;
+    let alive = true, worst = 0, last = a0, lastT = Date.now();
+    for (let i = 0; i < 40; i++) {
+      await host.waitForTimeout(1000);
+      const a = await rs(host); if (!a || (await st(host)).call !== 'on') { alive = false; break; }
+      if (a.rx > last) { last = a.rx; lastT = Date.now(); } else worst = Math.max(worst, Date.now() - lastT);
+    }
+    const a1 = (await rs(host))?.rx || 0, b1 = (await rs(guest))?.rx || 0;
+    ok('call survives 40 s of freezing connections', alive, `frozen conns ${env.mq.state.frozen}, total ${env.mq.state.conns}`);
+    ok('most voice packets get through', (a1 - a0) > 400 * 0.7 && (b1 - b0) > 400 * 0.7, `host got ${a1 - a0}/~400, guest got ${b1 - b0}/~400, worst gap ${worst} ms`);
+    env.mq.state.curtain = 0;
+  },
+  async bigrelay(browser, env) {
+    const nd = { nodirect: true };
+    const { host, guest, up } = await pair(browser, { hostConf: nd, guestConf: nd });
+    ok('session without a direct link', !!up);
+    const f = rndFile('video-10mb.bin', 10 * 1024 * 1024);
+    const t0 = Date.now();
+    await host.setInputFiles('.composer input[type=file]', f.file);
+    await guest.getByRole('button', { name: /Скачать/ }).click();
+    const got = await until(() => guest.evaluate(async () => { const i = [...[...__vz.rooms.values()][0].xfer.inc.values()][0]; if (!i || i.state !== 'done') return null; const h = await crypto.subtle.digest('SHA-256', await i.blob.arrayBuffer()); return [...new Uint8Array(h)].map(x => x.toString(16).padStart(2, '0')).join(''); }), 120000, 500);
+    const sec = (Date.now() - t0) / 1000;
+    ok('10 MB file through the relay arrives intact', got === f.hash, sec.toFixed(1) + ' s ≈ ' + Math.round(10240 / sec) + ' KB/s');
+    ok('chat still works during/after the transfer', (await sendText(host, 'после файла'), !!(await hasText(guest, 'после файла'))));
+    // the same under the 16 KB curtain: slower, but it must arrive
+    env.mq.state.curtain = 16000;
+    const f2 = rndFile('photo-400kb.bin', 400 * 1024);
+    const t1 = Date.now();
+    await host.setInputFiles('.composer input[type=file]', f2.file);
+    const got2 = await until(() => guest.evaluate(async () => { const i = [...[...__vz.rooms.values()][0].xfer.inc.values()].find(x => x.name === 'photo-400kb.bin'); if (!i || i.state !== 'done') return null; const h = await crypto.subtle.digest('SHA-256', await i.blob.arrayBuffer()); return [...new Uint8Array(h)].map(x => x.toString(16).padStart(2, '0')).join(''); }), 150000, 500);
+    ok('400 KB file arrives intact through freezing connections', got2 === f2.hash, ((Date.now() - t1) / 1000).toFixed(1) + ' s');
+    env.mq.state.curtain = 0;
   },
   async receipts(browser) {
     const { host, guest, up } = await pair(browser);

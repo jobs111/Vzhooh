@@ -4,7 +4,7 @@
 import { ac } from './sound';
 import { concat, U8 } from './util';
 
-const FRAME_MS = 20, PACK = 3;               // 3 × 20 ms frames per packet = 60 ms
+const FRAME_MS = 20, PACK = 5;               // 5 × 20 ms frames per packet = 100 ms (fewer packets → less overhead)
 const OPUS_RATE = 48000, ADPCM_RATE = 8000;
 
 let opusOk: Promise<boolean> | null = null;
@@ -241,7 +241,7 @@ export class RelayAudio {
     if (!pcm.length || this.stopped) return;
     for (let i = 0; i < pcm.length; i += 4) { const v = Math.abs(pcm[i]); if (v > this.stats.rxPeak) this.stats.rxPeak = v; }
     const ctx = this.ctx, t0 = ctx.currentTime;
-    if (this.nextT < t0 + 0.02 || this.nextT > t0 + 0.7) this.nextT = t0 + 0.16;   // (re)start the jitter buffer
+    if (this.nextT < t0 + 0.02 || this.nextT > t0 + 1.0) this.nextT = t0 + 0.25;   // (re)start the jitter buffer
     const b = ctx.createBuffer(1, pcm.length, rate);
     b.getChannelData(0).set(pcm);
     const s = ctx.createBufferSource();

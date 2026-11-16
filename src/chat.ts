@@ -288,11 +288,12 @@ export function chatView(room: Room) {
   const callBox = h('div.call', { hidden: true });
   const remoteV = h('video.remote', { autoplay: true, playsInline: true }) as HTMLVideoElement;
   const localV = h('video.local', { autoplay: true, playsInline: true, muted: true }) as HTMLVideoElement;
+  const rimg = h('img.remote.rimg', { alt: '', hidden: true }) as HTMLImageElement;
   const callInfo = h('div.cinfo'), callBtns = h('div.cbtns');
-  callBox.append(remoteV, localV, callInfo, callBtns);
+  callBox.append(remoteV, rimg, localV, callInfo, callBtns);
   let callTick: any, wake: any;
   async function startCall(video: boolean) {
-    if (!room.canDirectCall) { room.retryDirect(); if (video) toast(t('videoRelay'), 6000); }
+    if (!room.canDirectCall && video) toast(t('videoRelay'), 7000);
     try { await room.callStart(video); }
     catch { toast(t('mediaErr'), 8000); }
   }
@@ -321,7 +322,9 @@ export function chatView(room: Room) {
         cb('✕ ' + t('decline'), () => room.callDecline(), '.bad')].filter(Boolean) as Node[]);
       return;
     }
-    if (rtc?.local && localV.srcObject !== rtc.local) localV.srcObject = rtc.local;
+    const mine = c.relay ? room.localCam : rtc?.local;
+    if (mine && localV.srcObject !== mine) localV.srcObject = mine;
+    rimg.hidden = !(c.relay && c.rvi && c.st === 'on');
     localV.hidden = !(c.cam || c.scr);
     localV.classList.toggle('scr', c.scr);
     const via = c.relay ? h('div.cvia', t('callRelay')) : null;
@@ -338,7 +341,7 @@ export function chatView(room: Room) {
     callInfo.replaceChildren(...[h('div.cname', title), time, via].filter(Boolean) as Node[]);
     callBtns.replaceChildren(...[
       cb(c.mic ? '🎙' : '🔇', () => room.toggleMic(), c.mic ? '' : '.offb', 'call-mic', t('voice')),
-      c.scr || c.relay ? null : cb(c.cam ? '📷' : '🚫📷', () => void room.toggleCam().catch(() => toast(t('mediaErr'))), c.cam ? '' : '.offb', 'call-cam', t('videoCall')),
+      c.scr ? null : cb(c.cam ? '📷' : '🚫📷', () => void room.toggleCam().catch(() => toast(t('mediaErr'))), c.cam ? '' : '.offb', 'call-cam', t('videoCall')),
       c.cam && !c.scr ? cb('🔄', () => void room.switchCam().catch(() => {})) : null,
       canScreen() && !c.relay ? cb('🖥', () => void screen(), c.scr ? '.onb' : '', 'call-screen', t('screen')) : null,
       cb('✕ ' + t('hangup'), () => room.callEnd(), '.bad', 'call-end')].filter(Boolean) as Node[]);
@@ -354,6 +357,7 @@ export function chatView(room: Room) {
     room.on('state', drawState),
     room.on('call', drawCall),
     room.on('media', drawCall),
+    room.on('rvideo', () => { rimg.src = room.rframe; }),
     room.on('closed', (why: string) => { if (why !== 'self') toast(t('cl_' + why), 6000); go('', true); }),
     app.on('net', drawState));
   const vis = () => { if (!document.hidden) room.markRead(); };

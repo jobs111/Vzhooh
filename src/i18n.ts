@@ -97,7 +97,7 @@ const S: Record<string, [string, string]> = {
   savedDisk: ['Сохранено на диск', 'Saved to disk'],
   sending: ['отправка', 'sending'],
   bigAsk: ['Файл большой ({0}). На телефоне он может не поместиться в память. Продолжить?', 'This file is large ({0}). It may not fit into memory on a phone. Continue?'],
-  relayOnlySmall: ['Сейчас связь идёт через ретранслятор: большие файлы уйдут, когда появится прямое соединение.', 'The link currently goes through a relay: large files will go once a direct connection is available.'],
+  relayOnlySmall: ['Прямой связи нет: через ретранслятор проходят файлы до 50 МБ. Этот файл уйдёт, когда появится прямое соединение — или сожмите его.', 'No direct link: files up to 50 MB pass through the relay. This file will go once a direct connection appears — or compress it.'],
   recErr: ['Нет доступа к микрофону. Разрешите его в браузере.', 'No microphone access. Please allow it in the browser.'],
   audioCall: ['Звонок', 'Call'],
   videoCall: ['Видеозвонок', 'Video call'],
@@ -142,7 +142,7 @@ const S: Record<string, [string, string]> = {
   // actions on the home screen
   actCall: ['Звонок', 'Call'],
   actShare: ['Раздать файл', 'Share a file'],
-  actQr: ['QR из ссылки', 'QR from a link'],
+  actQr: ['QR из текста', 'QR from text'],
   lobbies: ['Общие приглашения и раздачи', 'Shared invites and file shares'],
   // connection state
   netDown: ['Нет связи с серверами — переподключаюсь автоматически…', 'No connection to the servers — reconnecting automatically…'],
@@ -184,8 +184,18 @@ const S: Record<string, [string, string]> = {
   shareWait: ['Подключаюсь к владельцу файлов… У него должно быть открыто приложение.', 'Connecting to the owner of the files… They need to have the app open.'],
   rj_full: ['Сейчас слишком много скачиваний. Попробуйте через минуту.', 'Too many downloads right now. Please try again in a minute.'],
   // QR from a link
-  qrTitle: ['QR-код из ссылки', 'QR code from a link'],
-  qrHint: ['Вставьте ссылку или любой текст — QR-код появится сразу. Он вечный: работает, пока работает сама ссылка. Можно скачать картинку или сделать скриншот.', 'Paste a link or any text and the QR code appears at once. It never expires: it works as long as the link itself works. Download the image or take a screenshot.'],
+  qrTitle: ['QR-код из текста или ссылки', 'QR code from text or a link'],
+  qrHint: ['Вставьте ссылку или текст любой длины. Коды создаются прямо на устройстве и работают без интернета. Длинный текст превращается в серию пронумерованных кодов.', 'Paste a link or text of any length. The codes are made on the device and work without the internet. A long text becomes a numbered series of codes.'],
+  qrPh: ['Ссылка или любой текст…', 'A link or any text…'],
+  qrLink: ['Открыть в браузере', 'Open in a browser'], qrPlain: ['Просто текст', 'Plain text'],
+  qrLinkHint: ['Человек наводит камеру — текст открывается страницей в браузере, его можно скопировать или сохранить как .txt. Сам текст зашит в код и на сервер не попадает. Для обычной ссылки выберите «Просто текст» — тогда код откроет её напрямую.', 'The person points the camera and the text opens as a page in the browser; it can be copied or saved as .txt. The text is inside the code and never goes to a server. For an ordinary link choose “Plain text”: the code then opens it directly.'],
+  qrPlainHint: ['В коде сам текст или ссылка как есть: читает любой сканер, ссылка сразу откроется. Не требует ни сайта, ни интернета.', 'The code holds the text or link as is: any scanner reads it, a link opens at once. Needs neither this site nor the internet.'],
+  qrInfo: ['Символов: {0} · кодов: {1}', 'Characters: {0} · codes: {1}'],
+  qrMany: ['Кодов получилось {0} — показаны первые 60. Для такого объёма удобнее «Раздать файл».', '{0} codes — the first 60 are shown. For this much text “Share a file” is more convenient.'],
+  tvTitle: ['Текст из QR-кода', 'Text from a QR code'],
+  tvPart: ['Получено {0} из {1}. Осталось отсканировать коды:', 'Got {0} of {1}. Codes still to scan:'],
+  tvPartHint: ['Сканируйте остальные коды в любом порядке этим же телефоном — текст соберётся сам.', 'Scan the remaining codes in any order with the same phone — the text assembles itself.'],
+  tvBad: ['Не удалось прочитать текст из кода.', 'Could not read the text from the code.'],
   qrPng: ['Скачать PNG', 'Download PNG'],
   qrTooLong: ['Текст слишком длинный для QR-кода', 'The text is too long for a QR code'],
   // call room
@@ -233,7 +243,7 @@ const S: Record<string, [string, string]> = {
   cTitle: ['Как отправить?', 'How to send?'],
   cCount: ['Фото и видео: {0}', 'Photos and videos: {0}'],
   cOrig: ['Оригинал', 'Original'], cLow: ['Слабое сжатие', 'Light'], cMid: ['Среднее', 'Medium'], cHigh: ['Сильное', 'Strong'],
-  cRecRelay: ['Прямой связи сейчас нет: через ретранслятор проходят файлы до 1 МБ. Рекомендуется сильное сжатие — или оригинал уйдёт, когда появится прямая связь.', 'No direct link right now: only files up to 1 MB pass through the relay. Strong compression is recommended — or the original will go once a direct link appears.'],
+  cRecRelay: ['Прямой связи нет — файл пойдёт через ретранслятор (до 50 МБ, медленнее). Сжатие выбрано автоматически, чтобы дошло быстро; «Оригинал» тоже можно.', 'No direct link — the file goes through the relay (up to 50 MB, slower). Compression is preselected so that it arrives quickly; “Original” is possible too.'],
   cRecBig: ['Файл большой. Рекомендуется среднее сжатие — отправится в разы быстрее.', 'This is a big file. Medium compression is recommended — it will send several times faster.'],
   cNoVideo: ['Это видео здесь нельзя пережать (формат не поддерживается браузером). Оно отправится как есть.', 'This video cannot be re-encoded here (the browser does not support the format). It will be sent as is.'],
   cFail: ['Сжать не получилось — отправляю оригинал.', 'Compression failed — sending the original.'],
@@ -262,8 +272,8 @@ const S: Record<string, [string, string]> = {
   read: ['Прочитано', 'Read'],
   delivered: ['Доставлено', 'Delivered'],
   readRcpt: ['Показывать собеседнику, что я прочитал сообщение', 'Let others see when I have read a message'],
-  callRelay: ['через ретранслятор · только голос', 'via relay · voice only'],
-  videoRelay: ['Прямой связи нет — звоню голосом через ретранслятор (видео так не передать).', 'No direct link — calling by voice through the relay (video cannot go that way).'],
+  callRelay: ['через ретранслятор · голос, видео — кадрами', 'via relay · voice, video as snapshots'],
+  videoRelay: ['Прямой связи нет — звоню через ретранслятор. Камеру можно включить кнопкой 📷 в звонке: видео пойдёт отдельными кадрами.', 'No direct link — calling through the relay. Turn the camera on with 📷 in the call: video goes as separate snapshots.'],
 };
 
 export type Lang = 'ru' | 'en';

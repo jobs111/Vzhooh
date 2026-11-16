@@ -143,3 +143,10 @@ button.sm { padding: 6px 10px; font-size: 13px; flex: none; }
 .sheetin { background: var(--card); width: 100%; max-width: 560px; border-radius: 18px 18px 0 0; padding: 16px 16px calc(16px + env(safe-area-inset-bottom)); display: flex; flex-direction: column; gap: 10px; max-height: 92dvh; overflow-y: auto; }
 .sheetin h2 { margin: 0; color: var(--fg); font-size: 17px; }
 .cslider input { width: 100%; } .cest { font-weight: 600; text-align: center; } .crec { font-size: 13.5px; color: var(--mut); } .crec:empty { display: none; }
+
+.qrlist { display: flex; flex-direction: column; gap: 14px; align-items: center; }
+.qrcard { background: #fff; border-radius: 12px; padding: 8px; display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.qrnum { color: #111; font-weight: 700; font-size: 15px; }
+.tvtext { white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px; user-select: text; }
+.tvtext a { color: var(--acc); }
+.qrfull .qrcap:empty { display: none; }

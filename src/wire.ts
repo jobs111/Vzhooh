@@ -145,9 +145,9 @@ class Conn {
       this.connect();
     }
   }
-  kick() {
+  kick(wait = 4500) {
     if (this.stopped) return;
-    if (this.m?.up) this.ping(4500);
+    if (this.m?.up) this.ping(wait);
     else if (!this.m) { clearTimeout(this.retry); this.backoff = 1000; this.connect(); }
   }
   pub(topic: string, payload: U8): boolean { return !!this.m?.publish(topic, payload); }
@@ -188,10 +188,16 @@ export class Wire extends Emitter {
   unsub(topic: string) { if (this.subs.delete(topic)) this.conns.forEach(c => c.unsub(topic)); }
   dispatch(topic: string, payload: U8) { this.subs.get(topic)?.(payload); }
   /** Publish to every connected broker (or only to the fastest one for bulk data). Returns how many accepted it. */
-  pub(topic: string, payload: U8, bulk = false): number {
+  private rr = 0;
+  pub(topic: string, payload: U8, bulk: boolean | number = false): number {
     if (bulk) {
-      const best = this.conns.filter(c => c.up).sort((a, b) => a.rtt - b.rtt)[0];
-      return best && best.pub(topic, payload) ? 1 : 0;
+      // bulk = true: one relay, taken in turn (spreads the load); bulk = N: the N fastest relays at once
+      const ups = this.conns.filter(c => c.up).sort((a, b) => a.rtt - b.rtt);
+      if (!ups.length) return 0;
+      if (bulk === true) return ups[this.rr++ % ups.length].pub(topic, payload) ? 1 : 0;
+      let k = 0;
+      for (const c of ups.slice(0, bulk)) if (c.pub(topic, payload)) k++;
+      return k;
     }
     let n = 0;
     for (const c of this.conns) if (c.pub(topic, payload)) n++;
@@ -206,6 +212,9 @@ export class Wire extends Emitter {
     this.emit('change');
   }
   kick() { this.conns.forEach(c => c.kick()); }
+  /** A live stream (call) went silent: find a frozen connection fast. */
+  probeFast() { const t = now(); if (t - this.probedAt < 1500) return; this.probedAt = t; this.conns.forEach(c => c.kick(1800)); }
+  get slow() { return this.conns.some(c => c.up && c.curtain); }
   private probedAt = 0;
   /** Deliveries are timing out: check quickly whether the connections are still alive. */
   probe() {

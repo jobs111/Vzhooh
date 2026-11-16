@@ -60,6 +60,8 @@ export async function prepareFiles(files: File[], direct: boolean): Promise<File
   const vids = media.filter(f => f.type.startsWith('video/'));
   const one = vids.length === 1 && media.length === 1 ? vids[0] : null;
   const tooBig = !direct && media.some(f => f.size > RELAY_MAX);
+  // no direct link: files travel through the relay, so a sensible compression level is preselected (the original stays one tap away)
+  const auto: Level = !direct && media.some(f => f.size > 1024 * 1024) ? 2 : 0;
   let level: Level = 0, target = one ? one.size : 0;
   return new Promise(resolve => {
     const total = media.reduce((a, f) => a + f.size, 0);
@@ -121,6 +123,6 @@ export async function prepareFiles(files: File[], direct: boolean): Promise<File
       h('div.segs', ...btns), sl, est, rec, prog, go,
       h('button.wide', { onclick: () => { sig.cancel?.(); close(null); } }, t('cancel'))));
     document.body.append(box);
-    pick(0);
+    pick(auto);
   });
 }

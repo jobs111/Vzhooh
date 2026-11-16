@@ -37,7 +37,7 @@ export class Rtc {
   closed = false;
 
   constructor(private room: Room, private polite: boolean, ice: RTCIceServer[], public gen: number) {
-    const pc = this.pc = new RTCPeerConnection({ iceServers: ice });
+    const pc = this.pc = new RTCPeerConnection({ iceServers: ice, iceTransportPolicy: conf.get('nodirect', false) ? 'relay' : 'all' });
     pc.onicecandidate = e => {
       if (!e.candidate || !e.candidate.candidate) return;
       this.cq.push(e.candidate.toJSON());

@@ -10,7 +10,7 @@ import { qrCanvas } from './qr';
 import type { Room } from './room';
 import { beep, unlockAudio } from './sound';
 import { conf } from './store';
-import { callRoomView, lobbyView, qrToolView, shareCreateView } from './tools';
+import { callRoomView, lobbyView, qrToolView, shareCreateView, textView } from './tools';
 import { fmtClock, fmtSize, h, now } from './util';
 import { DEFAULT_BROKERS } from './wire';
 
@@ -95,6 +95,7 @@ export async function route() {
   }
   if (k === 'l') { const l = app.lobbies.get(v); if (l) { lobbyView(l); return; } go('', true); return; }
   if (k === 'a' && v) { history.replaceState(null, '', location.pathname + location.search); adminGrantView(v); return; }
+  if (k === 't' && v) { await textView(v); return; }
   if (k === 'adm') { adminView(); return; }
   if (k === 'stat') { statsView(); return; }
   if (k === 'new') { newChatView(); return; }
@@ -187,7 +188,7 @@ function homeView() {
       !app.owner ? h('p.note', t('unclaimed')) : null,
       app.isAdmin ? h('div.acts',
         act('💬', t('newChat'), 'new', 'act-chat'), act('📞', t('actCall'), 'call', 'act-call'),
-        act('📁', t('actShare'), 'share', 'act-share'), act('▦', t('actQr'), 'qr', 'act-qr')) : null,
+        act('📁', t('actShare'), 'share', 'act-share'), act('▦', t('actQr'), 'qr', 'act-qr')) : h('button.wide', { onclick: () => go('qr'), id: 'act-qr' }, '▦ ' + t('actQr')),
       lobbyHead, lobbies,
       h('h2', t('chats')), list, pair,
       app.owner && !app.ownerKey ? h('button.link', { onclick: () => go('own') }, t('ownerLogin')) : null,

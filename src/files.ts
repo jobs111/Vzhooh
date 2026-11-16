@@ -5,16 +5,19 @@ import type { Msg } from './store';
 import { t } from './i18n';
 import { concat, fmtSize, now, sleep, U8 } from './util';
 
-export const RELAY_MAX = 1024 * 1024;       // biggest file allowed through public relays (they are shared, free servers)
+export const RELAY_MAX = 50 * 1024 * 1024;  // biggest file sent through the relays when there is no direct link
+export const RELAY_AUTO = 3 * 1024 * 1024;  // through the relay, bigger files download only after a tap (saves mobile data)
 export const AUTO_MAX = 24 * 1024 * 1024;   // auto-download limit on a direct link
 /** Types we are willing to render inline. Everything else (HTML, SVG, ...) is treated as an opaque download. */
 export const safeMime = (m: string) => /^(image\/(png|jpeg|gif|webp|avif|heic|heif)|(audio|video)\/[\w.+-]+)$/.test(m) ? m : 'application/octet-stream';
-const WIRE_CHUNK = 3000;
+const WIRE_CHUNK = 8000;
+const WIN_MIN = 16000, WIN_MAX = 480000;
 
 export interface Inc {
   tid: number; size: number; mime: string; name: string; got: number;
   state: 'idle' | 'wait' | 'run' | 'done' | 'gone' | 'err';
   want: boolean; viaDc: boolean; win: number; winEnd: number; last: number; t0: number;
+  ooo: Map<number, U8>;   // chunks that arrived ahead of order (several relays are used in turn)
   parts: BlobPart[]; partBytes: number; blobs: Blob[];
   sink?: { write(d: BufferSource): Promise<void>; close(): Promise<void> }; sinkQ: Promise<void>;
   blob?: Blob; url?: string; saved?: boolean;
@@ -40,7 +43,7 @@ export class Xfer {
     let i = this.inc.get(f.tid);
     if (!i) {
       i = { tid: f.tid, size: f.size, mime: f.mime, name: f.name, got: 0, state: 'idle', want: false, viaDc: false,
-        win: 6000, winEnd: 0, last: 0, t0: 0, parts: [], partBytes: 0, blobs: [], sinkQ: Promise.resolve() };
+        win: 32000, winEnd: 0, ooo: new Map(), last: 0, t0: 0, parts: [], partBytes: 0, blobs: [], sinkQ: Promise.resolve() };
       this.inc.set(f.tid, i);
     }
     return i;
@@ -49,7 +52,7 @@ export class Xfer {
    *  bigger ones wait for a tap. */
   auto(m: Msg) {
     const i = this.ensure(m);
-    if (i.size <= AUTO_MAX) this.fetch(i.tid);
+    if (i.size <= (this.room.direct ? AUTO_MAX : RELAY_AUTO)) this.fetch(i.tid);
   }
   fetch(tid: number, sink?: Inc['sink']) {
     const i = this.inc.get(tid);
@@ -74,19 +77,28 @@ export class Xfer {
     const dv = new DataView(u.buffer, u.byteOffset, u.byteLength);
     const tid = dv.getUint32(0), off = dv.getUint16(4) * 4294967296 + dv.getUint32(6);
     const i = this.inc.get(tid);
-    if (!i || i.state !== 'run' || off !== i.got) return;
-    const data = u.subarray(10, 10 + Math.min(u.length - 10, i.size - i.got));
+    if (!i || i.state !== 'run' || off < i.got) return;
+    if (off > i.got) {                       // ahead of order: keep it until the gap is filled
+      if (off < i.got + WIN_MAX + 65536 && i.ooo.size < 200) i.ooo.set(off, u.slice(10));
+      return;
+    }
+    this.take(i, u.subarray(10));
+    for (let nx = i.ooo.get(i.got); nx && i.state === 'run'; nx = i.ooo.get(i.got)) { i.ooo.delete(i.got); this.take(i, nx); }
+    for (const k of i.ooo.keys()) if (k < i.got) i.ooo.delete(k);
+    if (i.got >= i.size) void this.finish(i);
+    else if (!viaDc && i.got >= i.winEnd) { i.win = Math.min(i.win * 2, WIN_MAX); this.request(i); }
+    else this.changed(tid, true);
+  }
+  private take(i: Inc, chunk: U8) {
+    const data = chunk.subarray(0, Math.min(chunk.length, i.size - i.got));
     if (i.sink) {
       const copy = data.slice(), s = i.sink;
-      i.sinkQ = i.sinkQ.then(() => s.write(copy as unknown as BufferSource)).catch(() => { i.state = 'err'; this.changed(tid); });
+      i.sinkQ = i.sinkQ.then(() => s.write(copy as unknown as BufferSource)).catch(() => { i.state = 'err'; this.changed(i.tid); });
     } else {
       i.parts.push(data as unknown as BlobPart); i.partBytes += data.length;
       if (i.partBytes >= 8 << 20) { i.blobs.push(new Blob(i.parts)); i.parts = []; i.partBytes = 0; }
     }
     i.got += data.length; i.last = now();
-    if (i.got >= i.size) void this.finish(i);
-    else if (!viaDc && i.got >= i.winEnd) { i.win = Math.min(i.win * 2, 48000); this.request(i); }
-    else this.changed(tid, true);
   }
   private async finish(i: Inc) {
     i.state = 'done';
@@ -113,7 +125,7 @@ export class Xfer {
   tick(t: number) {
     for (const i of this.inc.values()) {
       if (i.state === 'run' && t - i.last > (i.viaDc ? 10000 : 4500)) {
-        if (!i.viaDc) i.win = Math.max(WIRE_CHUNK, i.win >> 1);
+        if (!i.viaDc) i.win = Math.max(WIN_MIN, i.win >> 1);
         this.request(i);
       }
     }
@@ -152,8 +164,8 @@ export class Xfer {
         if (viaDc) { if (!rtc || !(await rtc.dcSendBin(frame))) return; }
         else {
           await r.sendWire(1, concat([1], frame), true);
-          while (r.wireBuffered > 64000) await sleep(40);
-          await sleep(8);
+          while (r.wireBuffered > 200000) await sleep(40);
+          await sleep(16);   // ≈ 0.5 MB/s at most: public relays are shared, do not flood them
         }
       }
       off = sliceEnd;
