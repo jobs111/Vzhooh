@@ -45,6 +45,40 @@ function brokerTest(url: string, log: (s: string) => void): Promise<void> {
     setTimeout(fin, 12000);
   });
 }
+/** Deeper look at a relay that works: is the limit counted in bytes or packets, and does sending count too? */
+function budgetTest(url: string, log: (s: string) => void): Promise<void> {
+  return new Promise(res => {
+    const host = url.replace(/^wss?:\/\/([^@/]*@)?/, '').split('/')[0];
+    const a = new Mqtt(url), b = new Mqtt(url), tp = 'vz/diag/' + Math.random().toString(36).slice(2);
+    let small = 0, recvOnly = 0, done = false, phase = 0;
+    const fin = (note = '') => { if (done) return; done = true; log(`${host}: small packets ${small}/60, receive-only ${recvOnly}/24 KB${note}`); a.close(); b.close(); res(); };
+    a.onmsg = () => { if (phase === 1) small++; };
+    b.onmsg = () => { if (phase === 2) recvOnly++; };
+    let ups = 0;
+    const go = async () => {
+      if (++ups < 2) return;
+      a.subscribe([tp + '/s']); b.subscribe([tp + '/r']);
+      await sleep(400);
+      phase = 1;
+      const s150 = crypto.getRandomValues(new Uint8Array(150));
+      for (let i = 0; i < 60 && !done; i++) { a.publish(tp + '/s', s150); await sleep(50); }
+      await sleep(1500);
+      phase = 2;
+      const k1 = crypto.getRandomValues(new Uint8Array(1000));
+      for (let i = 0; i < 24 && !done; i++) { a.publish(tp + '/r', k1); await sleep(100); }
+      await sleep(2500);
+      let alive = false;
+      a.onpong = () => { alive = true; };
+      a.ping();
+      await sleep(2000);
+      fin(`, sender after 33 KB up: ${alive ? 'alive' : 'FROZEN'}`);
+    };
+    a.onup = go; b.onup = go;
+    a.ondown = b.ondown = () => fin(' (connection lost)');
+    a.open(); b.open();
+    setTimeout(() => fin(' (timeout)'), 20000);
+  });
+}
 async function stun(servers: RTCIceServer[], ms = 5000): Promise<{ srflx: string[]; host: string[]; ms: number }> {
   const pc = new RTCPeerConnection({ iceServers: servers });
   const srflx = new Set<string>(), host = new Set<string>(), t0 = now();
@@ -99,6 +133,11 @@ export function diagView() {
     await siteTest(log);
     log('--- relays');
     await Promise.all(app.brokers().map(u => brokerTest(u, log)));
+    log('--- relay budget');
+    for (const c of app.wire.conns.filter(x => x.good)) await budgetTest(c.url, log);
+    log('--- app state');
+    for (const c of app.wire.conns) log(`${c.url.replace(/^wss?:\/\/([^@/]*@)?/, '').split('/')[0]}: ${c.good ? 'in use' : c.up ? 'connected, not delivering' : 'off'}${c.curtain ? `, freezes at ~${c.limit} B, replaced ${c.rotations}×` : ''}`);
+    for (const l of app.wire.log.slice(-12)) log('  ' + l);
     log('--- STUN');
     await stunTest(log);
     log('--- done');

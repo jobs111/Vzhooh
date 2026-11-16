@@ -22,6 +22,7 @@ export class Mqtt {
   ondown?: (why: string) => void;
   onmsg?: (topic: string, payload: U8) => void;
   onpong?: () => void;
+  onsuback?: () => void;
   ontraffic?: () => void;
 
   constructor(public url: string, private keepAlive = 90) {}
@@ -97,6 +98,7 @@ export class Mqtt {
         this.onmsg?.(topic, body.slice(2 + tl + (qos ? 2 : 0)));
         break;
       }
+      case 9: this.onsuback?.(); break; // SUBACK
       case 13: this.onpong?.(); break; // PINGRESP
     }
   }

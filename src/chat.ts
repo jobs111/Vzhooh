@@ -242,6 +242,7 @@ export function chatView(room: Room) {
     let warned = false;
     for (const f of list) {
       if (!room.direct && !room.local && f.size > RELAY_MAX && !warned) { warned = true; toast(t('relayOnlySmall'), 6000); }
+      else if (!room.direct && !room.local && app.wire.slow && f.size > 200 * 1024 && !warned) { warned = true; toast(t('thinNet'), 8000); }
       room.sendFile(f, f.name || 'file');
     }
   };
@@ -302,6 +303,22 @@ export function chatView(room: Room) {
     try { await room.toggleScreen(); }
     catch (e: any) { if (e?.name !== 'NotAllowedError' && e?.name !== 'AbortError') toast(t('noScreen'), 6000); }
   };
+  // where to listen: loudspeaker / earpiece / headset (the list comes from the browser; not every phone offers a choice)
+  const outName = (label: string) => /speakerphone|speaker phone/i.test(label) ? '🔊 ' + t('outSpeaker') : /earpiece/i.test(label) ? '📱 ' + t('outEar')
+    : /bluetooth/i.test(label) ? '🎧 Bluetooth' : /head(set|phone)|wired|usb/i.test(label) ? '🎧 ' + t('outHead') : /default|по умолчанию/i.test(label) || !label ? '⚙ ' + t('outDefault') : '🔈 ' + label;
+  const pickOutput = async () => {
+    const md = navigator.mediaDevices, can = 'setSinkId' in HTMLMediaElement.prototype || 'setSinkId' in AudioContext.prototype;
+    const outs = can && md?.enumerateDevices ? (await md.enumerateDevices()).filter(d => d.kind === 'audiooutput') : [];
+    if (outs.length < 2) { toast(t('outNo'), 9000); return; }
+    const box = h('div.sheet', { id: 'out-sheet', onclick: (e: Event) => { if (e.target === box) box.remove(); } }, h('div.sheetin', h('h2', t('outTitle')),
+      ...outs.map(d => h('button.wide' + (room.sink === d.deviceId ? '.primary' : ''), { onclick: async () => {
+        box.remove();
+        await room.setSink(d.deviceId);
+        try { await (remoteV as any).setSinkId?.(d.deviceId); } catch { /* ignore */ }
+      } }, outName(d.label))), h('button.wide', { onclick: () => box.remove() }, t('cancel'))));
+    document.body.append(box);
+  };
+  off.push(() => document.getElementById('out-sheet')?.remove());
   const cb = (label: string, fn: () => void, cls = '', id = '', title = '') => h('button.cb' + cls, { onclick: fn, id: id || undefined, title: title || undefined }, label);
   const drawCall = () => {
     const c = room.call, rtc = room.rtc;
@@ -341,6 +358,7 @@ export function chatView(room: Room) {
     callInfo.replaceChildren(...[h('div.cname', title), time, via].filter(Boolean) as Node[]);
     callBtns.replaceChildren(...[
       cb(c.mic ? '🎙' : '🔇', () => room.toggleMic(), c.mic ? '' : '.offb', 'call-mic', t('voice')),
+      cb('🔊', () => void pickOutput(), '', 'call-out', t('outTitle')),
       c.scr ? null : cb(c.cam ? '📷' : '🚫📷', () => void room.toggleCam().catch(() => toast(t('mediaErr'))), c.cam ? '' : '.offb', 'call-cam', t('videoCall')),
       c.cam && !c.scr ? cb('🔄', () => void room.switchCam().catch(() => {})) : null,
       canScreen() && !c.relay ? cb('🖥', () => void screen(), c.scr ? '.onb' : '', 'call-screen', t('screen')) : null,

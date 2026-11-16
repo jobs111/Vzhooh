@@ -1,5 +1,6 @@
 // Optional compression of photos and videos before sending (the default is always "original").
 // Photos: resize + JPEG. Videos: re-encoded in the browser (WebCodecs) to a chosen target size.
+import { app } from './app';
 import { RELAY_MAX } from './files';
 import { t } from './i18n';
 import { toast } from './ui';
@@ -61,7 +62,8 @@ export async function prepareFiles(files: File[], direct: boolean): Promise<File
   const one = vids.length === 1 && media.length === 1 ? vids[0] : null;
   const tooBig = !direct && media.some(f => f.size > RELAY_MAX);
   // no direct link: files travel through the relay, so a sensible compression level is preselected (the original stays one tap away)
-  const auto: Level = !direct && media.some(f => f.size > 1024 * 1024) ? 2 : 0;
+  const thin = !direct && app.wire.slow;
+  const auto: Level = thin ? 3 : !direct && media.some(f => f.size > 1024 * 1024) ? 2 : 0;
   let level: Level = 0, target = one ? one.size : 0;
   return new Promise(resolve => {
     const total = media.reduce((a, f) => a + f.size, 0);
@@ -84,7 +86,8 @@ export async function prepareFiles(files: File[], direct: boolean): Promise<File
     };
     slider.oninput = () => { if (one) { target = Math.round(one.size * +slider.value / 100); if (!level) level = 2; upd(); } };
     ['cOrig', 'cLow', 'cMid', 'cHigh'].forEach((k, i) => btns.push(h('button.seg', { onclick: () => pick(i as Level), id: 'c-' + i }, t(k))));
-    if (tooBig) rec.textContent = t('cRecRelay');
+    if (thin) rec.textContent = t('cRecThin');
+    else if (tooBig || auto) rec.textContent = t('cRecRelay');
     else if (one && one.size > 300 * 1024 * 1024) rec.textContent = t('cRecBig');
     const close = (v: File[] | null) => { box.remove(); resolve(v); };
     const go = h('button.primary.wide', { id: 'c-send' }, t('send')) as HTMLButtonElement;

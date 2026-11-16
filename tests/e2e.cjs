@@ -52,13 +52,13 @@ async function scanQr(page, selector) {
   const r = jsQR(Uint8ClampedArray.from(img.data), img.w, img.h);
   return r && r.data;
 }
-const hashOf = (p, name) => until(() => p.evaluate(async n => {
+const hashOf = (p, name, ms = 40000) => until(() => p.evaluate(async n => {
   const all = [...__vz.rooms.values()].flatMap(r => [...r.xfer.inc.values()]);
   const i = all.find(x => x.name === n);
   if (!i || i.state !== 'done') return null;
   const h = await crypto.subtle.digest('SHA-256', await i.blob.arrayBuffer());
   return [...new Uint8Array(h)].map(x => x.toString(16).padStart(2, '0')).join('');
-}, name), 40000, 300);
+}, name), ms, 300);
 const stOf = (p, filter) => p.evaluate(f => [...__vz.rooms.values()].filter(r => !f || (f === 'lobby' ? r.rec.lid : true)).map(r => ({ id: r.rec.id, state: r.state, online: r.online, direct: r.direct, n: r.msgs.length, reject: r.reject, lid: r.rec.lid, share: r.rec.share })), filter);
 
 const tests = {
@@ -528,7 +528,7 @@ const tests = {
     ok('call connects', !!(await until(async () => { const a = await rs(host), b = await rs(guest); return a && b && a.rx > 10 && b.rx > 10; }, 10000)));
     // watch the call for 50 s: it must not drop, re-dial or go silent while the app keeps trying to get a direct link
     let worstGap = 0, last = (await rs(host)).rx, lastT = Date.now(), dropped = false;
-    for (let i = 0; i < 50; i++) {
+    for (let i = 0; i < +(process.env.RUSSIA_SEC || 50); i++) {
       await host.waitForTimeout(1000);
       const a = await rs(host), sa = await st(host), sb = await st(guest);
       if (!a || sa.call !== 'on' || sb.call !== 'on') { dropped = true; break; }
@@ -537,6 +537,10 @@ const tests = {
     ok('call stays up for 50 s despite direct-link retries', !dropped);
     ok('voice keeps flowing (no silent gaps over 2 s)', worstGap < 2000, 'worst gap ' + worstGap + ' ms');
     ok('audible on both sides', (await rs(host)).rxPeak > 0.01 && (await rs(guest)).rxPeak > 0.01);
+    await host.click('#call-out');
+    const outs = await until(() => host.evaluate(() => { const b = document.querySelectorAll('#out-sheet button'); return b.length ? [...b].map(x => x.textContent) : document.querySelector('.toast')?.textContent; }), 5000);
+    if (Array.isArray(outs)) { await host.locator('#out-sheet button').nth(outs.length - 2).click(); ok('audio output can be chosen', await host.evaluate(() => !![...__vz.rooms.values()][0].sink), outs.join(' | ')); }
+    else ok('audio output: honest message when the browser offers no choice', /браузер/.test(String(outs)));
     await host.click('#call-cam');
     ok('camera in a relay call: snapshots reach the other side', !!(await until(() => guest.evaluate(() => { const i = document.querySelector('img.rimg'); return i && !i.hidden && i.naturalWidth > 100; }), 10000)));
     ok('own camera preview shown', !!(await until(() => host.evaluate(() => { const v = document.querySelector('video.local'); return !v.hidden && v.videoWidth > 0; }), 6000)));
@@ -587,21 +591,23 @@ const tests = {
     const nd = { nodirect: true };
     const { host, guest, up } = await pair(browser, { hostConf: nd, guestConf: nd });
     ok('session under the 16 KB curtain', !!up);
+    ok('freeze limit measured in advance (before any call)', !!(await until(() => host.evaluate(() => __vz.wire.conns[0].curtain), 12000)) && !!(await until(() => guest.evaluate(() => __vz.wire.conns[0].curtain), 12000)));
     const rs = p => p.evaluate(() => { const s = [...__vz.rooms.values()][0].relayStats; return s ? { ...s } : null; });
     await host.click('button[title="Звонок"]');
     await until(async () => (await st(guest)).call === 'in', 15000);
     await guest.click('#call-accept');
-    await until(async () => { const a = await rs(host); return a && a.rx > 5; }, 15000);
-    const a0 = (await rs(host)).rx, b0 = (await rs(guest)).rx;
-    let alive = true, worst = 0, last = a0, lastT = Date.now();
+    await until(async () => { const a = await rs(host); return a && a.rx > 3; }, 15000);
+    const a0 = await rs(host), b0 = await rs(guest);
+    let alive = true, worst = 0, last = a0.rx, lastT = Date.now();
     for (let i = 0; i < 40; i++) {
       await host.waitForTimeout(1000);
       const a = await rs(host); if (!a || (await st(host)).call !== 'on') { alive = false; break; }
-      if (a.rx > last) { last = a.rx; lastT = Date.now(); } else worst = Math.max(worst, Date.now() - lastT);
+      if (a.rx > last) { worst = Math.max(worst, Date.now() - lastT); last = a.rx; lastT = Date.now(); }
     }
-    const a1 = (await rs(host))?.rx || 0, b1 = (await rs(guest))?.rx || 0;
+    const a1 = await rs(host), b1 = await rs(guest);
     ok('call survives 40 s of freezing connections', alive, `frozen conns ${env.mq.state.frozen}, total ${env.mq.state.conns}`);
-    ok('most voice packets get through', (a1 - a0) > 400 * 0.7 && (b1 - b0) > 400 * 0.7, `host got ${a1 - a0}/~400, guest got ${b1 - b0}/~400, worst gap ${worst} ms`);
+    const ra = (a1.rx - a0.rx) / (b1.tx - b0.tx), rb = (b1.rx - b0.rx) / (a1.tx - a0.tx);
+    ok('voice delivery ≥ 93%, no silence over 2.5 s', ra > 0.93 && rb > 0.93 && worst < 2500, `${Math.round(ra * 100)}% / ${Math.round(rb * 100)}%, worst gap ${worst} ms`);
     env.mq.state.curtain = 0;
   },
   async bigrelay(browser, env) {
@@ -624,6 +630,80 @@ const tests = {
     const got2 = await until(() => guest.evaluate(async () => { const i = [...[...__vz.rooms.values()][0].xfer.inc.values()].find(x => x.name === 'photo-400kb.bin'); if (!i || i.state !== 'done') return null; const h = await crypto.subtle.digest('SHA-256', await i.blob.arrayBuffer()); return [...new Uint8Array(h)].map(x => x.toString(16).padStart(2, '0')).join(''); }), 150000, 500);
     ok('400 KB file arrives intact through freezing connections', got2 === f2.hash, ((Date.now() - t1) / 1000).toFixed(1) + ' s');
     env.mq.state.curtain = 0;
+  },
+  async beeline(browser) {
+    // Mobile network as measured in the field: three relays connect but deliver nothing, the only working one freezes
+    // every connection after ~7 KB and needs ~1.2 s to connect; a direct link never succeeds.
+    const dead1 = await broker(MQ + 1, { mute: true }), dead2 = await broker(MQ + 2, { mute: true });
+    const thin = await broker(MQ + 3, { curtain: 7000, delay: 1200 });
+    const cf = { nodirect: true, brokers: [`ws://127.0.0.1:${MQ + 1}`, `ws://127.0.0.1:${MQ + 2}`, `ws://127.0.0.1:${MQ + 3}`] };
+    try {
+      const { host, guest, up } = await pair(browser, { hostConf: cf, guestConf: cf });
+      ok('session on the "mobile" network', !!up);
+      for (let i = 0; i < 25; i++) { await sendText(host, 'сообщение ' + i + ' ' + require('crypto').randomBytes(60).toString('base64')); await host.waitForTimeout(150); }
+      let n = 0;
+      ok('25 chat messages arrive', !!(await until(async () => (n = await guest.evaluate(() => document.querySelectorAll('.msg:not(.me) .txt').length)) >= 25, 60000, 500)), n + '/25');
+      const w = await guest.evaluate(() => __vz.wire.conns.map(c => ({ up: c.up, good: c.good, curtain: c.curtain, limit: c.limit, rot: c.rotations })));
+      ok('dead relays are not used, the working one is known as "freezing"', !w[0].good && !w[1].good && w[2].good && w[2].curtain, JSON.stringify(w));
+      const rs = p => p.evaluate(() => { const s = [...__vz.rooms.values()][0].relayStats; return s ? { ...s } : null; });
+      await host.click('button[title="Звонок"]');
+      ok('ring arrives', !!(await until(async () => (await st(guest)).call === 'in', 12000)));
+      await guest.click('#call-accept');
+      ok('call connects', !!(await until(async () => { const a = await rs(host), b = await rs(guest); return a && b && a.rx > 3 && b.rx > 3; }, 15000)));
+      const SEC = +(process.env.CALL_SEC || 300);
+      const a0 = await rs(host), b0 = await rs(guest);
+      let dropped = false, worst = 0, last = a0.rx, lastT = Date.now(), gaps = 0;
+      for (let i = 0; i < SEC; i++) {
+        await host.waitForTimeout(1000);
+        const a = await rs(host);
+        if (!a || (await st(host)).call !== 'on' || (await st(guest)).call !== 'on') { dropped = true; break; }
+        if (a.rx > last) { const g = Date.now() - lastT; if (g > 1500) gaps++; worst = Math.max(worst, g); last = a.rx; lastT = Date.now(); }
+      }
+      const a1 = await rs(host), b1 = await rs(guest);
+      const sentToHost = b1.tx - b0.tx, gotHost = a1.rx - a0.rx, sentToGuest = a1.tx - a0.tx, gotGuest = b1.rx - b0.rx;
+      ok(`call stays up for ${SEC} s`, !dropped);
+      ok('voice delivery ≥ 93% both ways', gotHost / sentToHost > 0.93 && gotGuest / sentToGuest > 0.93, `host ${gotHost}/${sentToHost} (${Math.round(gotHost / sentToHost * 100)}%), guest ${gotGuest}/${sentToGuest} (${Math.round(gotGuest / sentToGuest * 100)}%), codec ${a1.codecOut}`);
+      ok('no silence longer than 2.5 s', worst < 2500, `worst gap ${worst} ms, gaps over 1.5 s: ${gaps}`);
+      const w2 = await host.evaluate(() => __vz.wire.conns.map(c => c.rotations));
+      if (process.env.DBG) for (const [n, pg] of [['H', host], ['G', guest]]) console.log(n, (await pg.evaluate(() => __vz.wire.log.filter(x => x.includes('stall')).concat(__vz.wire.log.slice(-6)))).join('\n  '));
+      console.log('     connections replaced ahead of the freeze:', w2[2], '| frozen on the relay side:', thin.state.frozen, 'of', thin.state.conns);
+      await host.click('#call-end');
+      await until(async () => (await st(guest)).call === 'idle', 8000);
+      const f = rndFile('small-photo.bin', 150 * 1024);
+      const t0 = Date.now();
+      await host.setInputFiles('.composer input[type=file]', f.file);
+      ok('150 KB file arrives intact on the thin relay', (await hashOf(guest, 'small-photo.bin', 300000)) === f.hash, ((Date.now() - t0) / 1000).toFixed(0) + ' s');
+    } finally { await dead1.close(); await dead2.close(); await thin.close(); }
+  },
+  async glare(browser, env) {
+    const rs = p => p.evaluate(() => { const s = [...__vz.rooms.values()][0].relayStats; return s ? { ...s } : null; });
+    const talking = (h, g) => until(async () => { const a = await st(h), b = await st(g), x = await rs(h), y = await rs(g); return a.call === 'on' && b.call === 'on' && x && y && x.rx > 10 && y.rx > 10; }, 15000);
+    for (const [name, conf] of [['relay', { nodirect: true }], ['direct', {}]]) {
+      const { host, guest, up } = await pair(browser, { hostConf: conf, guestConf: conf });
+      ok(name + ': session', !!up);
+      if (name === 'direct') await until(async () => (await st(host)).direct && (await st(guest)).direct, 12000);
+      const flowing = name === 'relay' ? () => talking(host, guest) : () => until(async () => (await st(host)).call === 'on' && (await st(guest)).call === 'on' && await host.evaluate(async () => { let a = 0; (await [...__vz.rooms.values()][0].rtc.pc.getStats()).forEach(x => { if (x.type === 'inbound-rtp' && x.kind === 'audio') a = x.packetsReceived; }); return a > 30; }), 15000, 400);
+      // 1. both press "call" in the same instant
+      const dial = p => p.evaluate(() => { void [...__vz.rooms.values()][0].callStart(false); });
+      await Promise.all([dial(host), dial(guest)]);
+      ok(name + ': simultaneous calls become one conversation', !!(await flowing()));
+      await host.click('#call-end');
+      ok(name + ': ends cleanly', !!(await until(async () => (await st(host)).call === 'idle' && (await st(guest)).call === 'idle', 8000)));
+      await host.waitForTimeout(2500);
+      ok(name + ': no leftover ringing', (await st(host)).call === 'idle' && (await st(guest)).call === 'idle');
+      if (name !== 'relay') continue;
+      // 2. the second call is pressed 2 s later, while the first ring has not got through yet (slow network)
+      env.mq.state.drop = true;
+      await host.click('button[title="Звонок"]');
+      await host.waitForTimeout(2000);
+      await guest.click('button[title="Звонок"]');
+      await guest.waitForTimeout(800);
+      env.mq.state.drop = false;
+      ok(name + ': calls 2 s apart on a slow network still connect', !!(await talking(host, guest)));
+      await guest.click('#call-end');
+      ok(name + ': ends cleanly again', !!(await until(async () => (await st(host)).call === 'idle' && (await st(guest)).call === 'idle', 8000)));
+      for (const c of browser.contexts()) await c.close();
+    }
   },
   async receipts(browser) {
     const { host, guest, up } = await pair(browser);

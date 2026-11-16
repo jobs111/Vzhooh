@@ -4,7 +4,11 @@
 import { ac } from './sound';
 import { concat, U8 } from './util';
 
-const FRAME_MS = 20, PACK = 5;               // 5 × 20 ms frames per packet = 100 ms (fewer packets → less overhead)
+const FRAME_MS = 20;
+// Normal relay: 3 frames (60 ms) per packet at ~24 kbit/s — good voice quality.
+// Thin relay (connections freeze after a few KB): 10 frames (200 ms) per packet at 8 kbit/s — every byte counts.
+const PACK_FAST = 3, PACK_THIN = 10, ADPCM_PACK = 5;
+const BR_FAST = 24000, BR_THIN = 8000;
 const OPUS_RATE = 48000, ADPCM_RATE = 8000;
 
 let opusOk: Promise<boolean> | null = null;
@@ -107,13 +111,18 @@ export class RelayAudio {
   private lastSeq = -1;
   private nextT = 0;
   private useOpus: boolean;
+  private decTs = 0;
+  private mutedN = 0;
+  private jit = 0.2;
   private stopped = false;
 
-  constructor(private send: (pkt: U8) => void, peerCodecs: string[], mine: string[], private bitrate: number) {
+  private thin = false;
+  constructor(private send: (pkt: U8) => void, peerCodecs: string[], mine: string[], private isThin: () => boolean) {
     const ctx = ac();
     if (!ctx) throw new Error('noaudio');
     this.ctx = ctx;
     this.useOpus = mine.includes('o') && peerCodecs.includes('o');
+    this.thin = isThin();
     this.stats.codecOut = this.useOpus ? 'opus' : 'adpcm';
   }
 
@@ -145,11 +154,11 @@ export class RelayAudio {
           const b = new Uint8Array(chunk.byteLength);
           chunk.copyTo(b);
           this.opusFrames.push(b);
-          if (this.opusFrames.length >= PACK) this.flushOpus();
+          if (this.opusFrames.length >= (this.thin ? PACK_THIN : PACK_FAST)) this.flushOpus();
         },
         error: () => { /* the next start of a call creates a new encoder */ },
       });
-      this.enc.configure({ codec: 'opus', sampleRate: OPUS_RATE, numberOfChannels: 1, bitrate: this.bitrate, opus: { frameDuration: FRAME_MS * 1000, application: 'voip', signal: 'voice', usedtx: false } });
+      this.cfg();
     }
     this.src = ctx.createMediaStreamSource(mic);
     this.proc = ctx.createScriptProcessor(2048, 1, 1);
@@ -160,18 +169,32 @@ export class RelayAudio {
     this.proc.connect(this.sink).connect(ctx.destination);
   }
 
+  private cfg() {
+    try { this.enc.configure({ codec: 'opus', sampleRate: OPUS_RATE, numberOfChannels: 1, bitrate: this.thin ? BR_THIN : BR_FAST, opus: { frameDuration: FRAME_MS * 1000, application: 'voip', signal: 'voice', usedtx: false } }); } catch { /* ignore */ }
+  }
+  /** Called once a second: follow the state of the relay (thin ↔ normal). */
+  adapt() {
+    const t = this.isThin();
+    if (t === this.thin) return;
+    this.thin = t;
+    this.stats.codecOut = (this.useOpus ? 'opus' : 'adpcm') + (t ? '/thin' : '');
+    if (this.useOpus && this.enc) this.cfg();
+  }
   private capture(x: Float32Array) {
     if (this.stopped) return;
     let peak = 0;
     for (let i = 0; i < x.length; i += 8) peak = Math.max(peak, Math.abs(x[i]));
     this.stats.level = peak;
     if (peak > this.stats.peak) this.stats.peak = peak;
-    if (this.muted) return;
+    if (this.muted) {       // muted: a tiny "still here" packet now and then, so the other side does not suspect a frozen line
+      if (++this.mutedN % 10 === 0) this.send(new Uint8Array([0, 0, 0, 0]));
+      return;
+    }
     const y = this.rs!.run(x);
     const buf = new Float32Array(this.pend.length + y.length);
     buf.set(this.pend); buf.set(y, this.pend.length);
     const rate = this.useOpus ? OPUS_RATE : ADPCM_RATE;
-    const per = (rate * FRAME_MS / 1000) * (this.useOpus ? 1 : PACK);
+    const per = (rate * FRAME_MS / 1000) * (this.useOpus ? 1 : ADPCM_PACK);
     let off = 0;
     for (; off + per <= buf.length; off += per) {
       const frame = buf.slice(off, off + per);
@@ -202,6 +225,7 @@ export class RelayAudio {
   onPacket(u: U8) {
     if (this.stopped || u.length < 4) return;
     const codec = u[0], seq = (u[1] << 8) | u[2], body = u.subarray(3);
+    if (codec === 0) return;
     if (this.lastSeq >= 0) {
       const d = (seq - this.lastSeq + 65536) % 65536;
       if (d === 0 || d > 32768) { this.stats.late++; return; }   // duplicate or too late
@@ -228,12 +252,13 @@ export class RelayAudio {
     }
     let p = 1;
     const cnt = body[0];
+    this.jit = cnt >= 8 || this.isThin() ? 0.5 : 0.2;   // thin relay: connections are swapped all the time, buffer more
     for (let k = 0; k < cnt && p + 2 <= body.length; k++) {
       const len = (body[p] << 8) | body[p + 1]; p += 2;
       const data = body.subarray(p, p + len); p += len;
       try {
         const W = window as any;
-        this.dec?.decode(new W.EncodedAudioChunk({ type: 'key', timestamp: (seq * PACK + k) * FRAME_MS * 1000, data }));
+        this.dec?.decode(new W.EncodedAudioChunk({ type: 'key', timestamp: (this.decTs++) * FRAME_MS * 1000, data }));
       } catch { /* ignore */ }
     }
   }
@@ -241,7 +266,7 @@ export class RelayAudio {
     if (!pcm.length || this.stopped) return;
     for (let i = 0; i < pcm.length; i += 4) { const v = Math.abs(pcm[i]); if (v > this.stats.rxPeak) this.stats.rxPeak = v; }
     const ctx = this.ctx, t0 = ctx.currentTime;
-    if (this.nextT < t0 + 0.02 || this.nextT > t0 + 1.0) this.nextT = t0 + 0.25;   // (re)start the jitter buffer
+    if (this.nextT < t0 + 0.02 || this.nextT > t0 + this.jit + 1.2) this.nextT = t0 + this.jit;   // (re)start the jitter buffer
     const b = ctx.createBuffer(1, pcm.length, rate);
     b.getChannelData(0).set(pcm);
     const s = ctx.createBufferSource();
@@ -251,6 +276,15 @@ export class RelayAudio {
     this.nextT += pcm.length / rate;
   }
 
+  /** Choose where the voice plays (speaker / earpiece / headset), where the browser allows it. */
+  async setSink(id: string): Promise<boolean> {
+    try {
+      const el: any = this.el, cx: any = this.ctx;
+      if (el?.setSinkId) { await el.setSinkId(id); return true; }
+      if (cx.setSinkId) { await cx.setSinkId(id); return true; }
+    } catch { /* ignore */ }
+    return false;
+  }
   stop() {
     if (this.stopped) return;
     this.stopped = true;

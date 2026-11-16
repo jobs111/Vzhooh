@@ -5,7 +5,7 @@ import type { Msg } from './store';
 import { t } from './i18n';
 import { concat, fmtSize, now, sleep, U8 } from './util';
 
-export const RELAY_MAX = 50 * 1024 * 1024;  // biggest file sent through the relays when there is no direct link
+export const RELAY_MAX = 100 * 1024 * 1024;  // biggest file sent through the relays when there is no direct link
 export const RELAY_AUTO = 3 * 1024 * 1024;  // through the relay, bigger files download only after a tap (saves mobile data)
 export const AUTO_MAX = 24 * 1024 * 1024;   // auto-download limit on a direct link
 /** Types we are willing to render inline. Everything else (HTML, SVG, ...) is treated as an opaque download. */
@@ -68,8 +68,12 @@ export class Xfer {
     const dc = r.direct;
     if (r.state !== 'up' || (!dc && i.size > RELAY_MAX)) { i.state = 'wait'; r.needDirect(); this.changed(i.tid); return; }
     i.viaDc = dc; i.state = 'run'; i.last = now();
+    // thin relay (connections freeze after a few KB): ask for small pieces that fit into one connection's budget
+    const budget = dc ? 0 : r.wireBudget;
+    const cs = budget ? Math.max(600, Math.min(1400, Math.floor(budget / 3))) : WIRE_CHUNK;
+    if (budget) i.win = Math.min(i.win, Math.max(cs, Math.floor(budget * 0.8)));
     i.winEnd = dc ? i.size : Math.min(i.size, i.got + i.win);
-    r.send({ t: 'fg', f: i.tid, o: i.got, l: dc ? 0 : i.winEnd - i.got });
+    r.send({ t: 'fg', f: i.tid, o: i.got, l: dc ? 0 : i.winEnd - i.got, cs });
     this.changed(i.tid);
   }
   onChunk(u: U8, viaDc: boolean) {
@@ -86,7 +90,7 @@ export class Xfer {
     for (let nx = i.ooo.get(i.got); nx && i.state === 'run'; nx = i.ooo.get(i.got)) { i.ooo.delete(i.got); this.take(i, nx); }
     for (const k of i.ooo.keys()) if (k < i.got) i.ooo.delete(k);
     if (i.got >= i.size) void this.finish(i);
-    else if (!viaDc && i.got >= i.winEnd) { i.win = Math.min(i.win * 2, WIN_MAX); this.request(i); }
+    else if (!viaDc && i.got >= i.winEnd) { i.win = Math.min(Math.max(i.win, 4000) * 2, WIN_MAX); this.request(i); }
     else this.changed(tid, true);
   }
   private take(i: Inc, chunk: U8) {
@@ -125,7 +129,7 @@ export class Xfer {
   tick(t: number) {
     for (const i of this.inc.values()) {
       if (i.state === 'run' && t - i.last > (i.viaDc ? 10000 : 4500)) {
-        if (!i.viaDc) i.win = Math.max(WIN_MIN, i.win >> 1);
+        if (!i.viaDc) i.win = Math.max(this.room.wireBudget ? 1200 : WIN_MIN, i.win >> 1);
         this.request(i);
       }
     }
@@ -137,7 +141,7 @@ export class Xfer {
   }
 
   /** Sender side: stream [from, from+len) (len 0 = to the end). A newer request cancels the older one. */
-  async serve(tid: number, from: number, len: number) {
+  async serve(tid: number, from: number, len: number, want = 0) {
     const r = this.room;
     let e = this.out.get(tid);
     if (!e) {
@@ -147,7 +151,7 @@ export class Xfer {
     if (!e || !(from >= 0) || from > e.blob.size) { r.send({ t: 'fn', f: tid }); return; }
     const gen = ++e.gen, size = e.blob.size;
     const viaDc = r.direct, rtc = r.rtc;
-    const cs = viaDc && rtc ? rtc.chunk : WIRE_CHUNK;
+    const cs = viaDc && rtc ? rtc.chunk : Math.max(500, Math.min(WIRE_CHUNK, want || WIRE_CHUNK));
     const end = len > 0 ? Math.min(from + len, size) : size;
     const head = (off: number) => {
       const h = new Uint8Array(10), dv = new DataView(h.buffer);
